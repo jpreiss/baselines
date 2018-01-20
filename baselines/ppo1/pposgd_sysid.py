@@ -14,6 +14,19 @@ def rolling_window(a, window):
     strides = a.strides + (a.strides[-1],)
     return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
 
+def examine_weights(pi):
+    var_list = pi.get_trainable_variables()
+    names = [v.name for v in var_list]
+    max_len = max(len(n) for n in names)
+    names = [n.ljust(max_len) for n in names]
+    vals = U.function([], var_list)()
+    for name, val in zip(names, vals):
+        mean_abs_val = np.mean(np.abs(val))
+        if mean_abs_val > 100:
+            print("warning: large mean abs weight in {}: {}".format(name, mean_abs_val))
+        if mean_abs_val < 0.001 and "bias" not in name:
+            print("warning: small mean abs weight in {}: {}".format(name, mean_abs_val))
+
 def traj_segment_generator(pi, env, horizon, stochastic):
     t = 0
     ac = env.action_space.sample() # not used, just so we have the datatype
@@ -166,6 +179,8 @@ def learn(env, policy_func, *,
     adam.sync()
     seg_gen = traj_segment_generator(pi, env, timesteps_per_actorbatch, stochastic=True)
 
+    examine_weights(pi)
+
     episodes_so_far = 0
     timesteps_so_far = 0
     iters_so_far = 0
@@ -286,6 +301,9 @@ def learn(env, policy_func, *,
         logger.record_tabular("TimeElapsed", time.time() - tstart)
         if MPI.COMM_WORLD.Get_rank()==0:
             logger.dump_tabular()
+
+        examine_weights(pi)
+
 
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]
