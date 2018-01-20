@@ -399,6 +399,15 @@ class _Function(object):
         # Update feed dict with givens.
         for inpt in self.givens:
             feed_dict[inpt] = feed_dict.get(inpt, self.givens[inpt])
+
+        if False:
+            print(">>> feed dict! <<<")
+            for k, v in feed_dict.items():
+                try:
+                    print(k.name, ":", v.shape)
+                except:
+                    print(k.name, ":", v)
+
         results = get_session().run(self.outputs_update, feed_dict=feed_dict)[:-1]
         if self.check_nan:
             if any(np.isnan(r).any() for r in results):

@@ -6,6 +6,8 @@ class Dataset(object):
         self.deterministic = deterministic
         self.enable_shuffle = shuffle
         self.n = next(iter(data_map.values())).shape[0]
+        for v in iter(data_map.values()):
+            assert v.shape[0] == self.n
         self._next_id = 0
         self.shuffle()
 
