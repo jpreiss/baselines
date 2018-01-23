@@ -8,6 +8,12 @@ from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
 from collections import deque
 
+# reshape array of (..., n) to (..., < n, window)
+def rolling_window(a, window):
+    shape = a.shape[:-1] + (a.shape[-1] - window + 1, window)
+    strides = a.strides + (a.strides[-1],)
+    return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
+
 def traj_segment_generator(pi, env, horizon, stochastic):
     t = 0
     N = env.N
@@ -21,6 +27,8 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     cur_ep_len = np.zeros(N) # len of current episode
     ep_rets = [] # returns of completed episodes in this segment
     ep_lens = [] # lengths of ...
+
+    latent_dim = pi.latent_dim
 
     # Initialize history arrays
     obs = np.array([ob for _ in range(horizon)])
@@ -40,15 +48,18 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             env.render()
         prevac = ac
         ac, vpred = pi.act(stochastic, ob)
+
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
         if t > 0 and t % horizon == 0:
             print("YIELDING")
             k_episodes += 1
+            true_sysid = env.sysid_values()
+            emb = pi.sysid_to_embedded(true_sysid)
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
-                    "ep_rets" : ep_rets, "ep_lens" : ep_lens}
+                    "ep_rets" : ep_rets, "ep_lens" : ep_lens, "emb" : emb}
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -129,6 +140,9 @@ def learn(env, policy_func, *,
         adam_epsilon=1e-5,
         schedule='constant' # annealing for stepsize parameters (epsilon and adam)
         ):
+
+    N = env.N
+
     # Setup losses and stuff
     # ----------------------------------------
     ob_space = env.observation_space
@@ -209,13 +223,53 @@ def learn(env, policy_func, *,
 
         env.sample_sysid()
         seg = seg_gen.__next__()
-        add_vtarg_and_adv(env.N, seg, gamma, lam)
+        add_vtarg_and_adv(N, seg, gamma, lam)
+
+        # slice-n-dice the ob, ac trajectories to get the training data for sysid
+        ob, ac, atarg, tdlamret, emb = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"], seg["emb"]
+        sysid_dim = env.sysid_dim
+        assert len(ob_space.shape) == 1
+        assert len(ac_space.shape) == 1
+        ob_dim = ob_space.shape[0] - sysid_dim
+        ac_dim = ac_space.shape[0]
+        assert ob.shape == (timesteps_per_actorbatch, N, ob_space.shape[0])
+        ob_trajs = ob[:,:,ob_dim:].transpose([1,0,2])
+        # just make it "shape check" for now... not dealing with restarts yet
+        traj_len = pi.traj_len
+
+        all_windows = []
+        all_true_embeds = []
+
+        # traj input should be [batch, window, ob/ac]
+
+        for i in range(N):
+            t = ob_trajs[i,:,:]
+            # t is rollout * ob
+            windows = rolling_window(t.T, traj_len).transpose([1,2,0])
+            assert windows.shape[0] < timesteps_per_actorbatch
+            assert windows.shape[1] == traj_len
+            assert windows.shape[2] == ob_dim
+            # windows is < rollout, window, ob
+            all_windows.append(windows)
+            # embed is N * embed_dim
+            e = np.tile(emb[i,:], (windows.shape[0], 1))
+            all_true_embeds.append(e)
+
+        all_windows = np.concatenate(all_windows, axis=0)
+        all_true_embeds = np.concatenate(all_true_embeds, axis=0)
+        assert(all_true_embeds.shape[0] == all_windows.shape[0])
+
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         seg_flatten_batches(seg)
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
+        traj_ob = U.get_placeholder(name="traj_ob",
+            dtype=tf.float32, shape=[None, traj_len, ob_dim])
+        traj_ac = U.get_placeholder(name="traj_ac",
+            dtype=tf.float32, shape=[None, traj_len, ac_dim])
+
         d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
         optim_batchsize = optim_batchsize or ob.shape[0]
 
@@ -254,7 +308,7 @@ def learn(env, policy_func, *,
         episodes_so_far += len(lens)
         timesteps_so_far += sum(lens)
         if len(lens) == 0:
-            timesteps_since_last_episode_end += env.N * timesteps_per_actorbatch
+            timesteps_since_last_episode_end += N * timesteps_per_actorbatch
             if timesteps_since_last_episode_end > 40000:
                 print("timesteps since last episode ended > 40000 - env learned")
                 break
