@@ -6,24 +6,20 @@ from baselines import logger
 import sysid_policy
 
 def train(env_id, num_timesteps, seed):
-    from baselines.ppo1 import mlp_policy, pposgd_sysid
+    from baselines.ppo1 import mlp_policy, mlp_batch_policy, pposgd_sysid, pposgd_simple, pposgd_batch
+
     U.make_session(num_cpu=1).__enter__()
     set_global_seeds(seed)
-
-    #env = gym.make(env_id)
-    #def policy_fn(name, ob_space, ac_space):
-        #return mlp_policy.MlpPolicy(name=name, ob_space=ob_space, ac_space=ac_space,
-            #hid_size=64, num_hid_layers=2)
 
     env = gym.make(env_id).env
     sysid_dim = int(env.sysid_dim)
 
-    def policy_fn(name, ob_space, ac_space):
+    def sysid_policy_fn(name, ob_space, ac_space):
 
         # user chosen hyperparameters
         latent_dim = 3
-        n_history = 100
-        alpha_sysid = 1
+        n_history = 20
+        alpha_sysid = 0.0
 
         assert len(ob_space.high.shape) == 1
         assert len(ac_space.high.shape) == 1
@@ -34,15 +30,18 @@ def train(env_id, num_timesteps, seed):
             obs_dim, ac_space.high.shape[0],
             latent_dim, sysid_dim, n_history, alpha_sysid)
 
+    def mlp_policy_fn(name, ob_space, ac_space):
+        return mlp_policy.MlpPolicy(name=name, ob_space=ob_space, ac_space=ac_space,
+            hid_size=64, num_hid_layers=2)
 
-    env = bench.Monitor(env, logger.get_dir())
+    #env = bench.Monitor(env, logger.get_dir())
     env.seed(seed)
     gym.logger.setLevel(logging.WARN)
-    pposgd_sysid.learn(env, policy_fn,
+    pposgd_simple.learn(env, mlp_policy_fn,
             max_timesteps=num_timesteps,
             timesteps_per_actorbatch=2048,
-            clip_param=0.2, entcoeff=0.0,
-            optim_epochs=10, optim_stepsize=3e-4, optim_batchsize=64,
+            clip_param=0.1, entcoeff=0.0,
+            optim_epochs=5, optim_stepsize=3e-4, optim_batchsize=512,
             gamma=0.99, lam=0.95, schedule='linear',
         )
     env.close()

@@ -27,13 +27,18 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     acs = np.array([ac for _ in range(horizon)])
     prevacs = acs.copy()
 
+    k_episodes = 0
+    render_every = 20
     while True:
+        if k_episodes % render_every == 1:
+            env.render()
         prevac = ac
         ac, vpred = pi.act(stochastic, ob)
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
         if t > 0 and t % horizon == 0:
+            k_episodes += 1
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens}
@@ -126,6 +131,7 @@ def learn(env, policy_func, *,
     compute_losses = U.function([ob, ac, atarg, ret, lrmult], losses)
 
     U.initialize()
+    #writer = tf.summary.FileWriter('./board', tf.get_default_session().graph)
     adam.sync()
 
     # Prepare for rollouts
@@ -136,10 +142,12 @@ def learn(env, policy_func, *,
     timesteps_so_far = 0
     iters_so_far = 0
     tstart = time.time()
-    lenbuffer = deque(maxlen=100) # rolling buffer for episode lengths
-    rewbuffer = deque(maxlen=100) # rolling buffer for episode rewards
+    lenbuffer = deque(maxlen=10) # rolling buffer for episode lengths
+    rewbuffer = deque(maxlen=10) # rolling buffer for episode rewards
 
     assert sum([max_iters>0, max_timesteps>0, max_episodes>0, max_seconds>0])==1, "Only one time constraint permitted"
+
+    timesteps_since_last_episode_end = 0
 
     while True:
         if callback: callback(locals(), globals())
@@ -158,6 +166,7 @@ def learn(env, policy_func, *,
             cur_lrmult =  max(1.0 - float(timesteps_so_far) / max_timesteps, 0)
         else:
             raise NotImplementedError
+        print("lr:", cur_lrmult)
 
         logger.log("********** Iteration %i ************"%iters_so_far)
 
@@ -205,6 +214,13 @@ def learn(env, policy_func, *,
         logger.record_tabular("EpThisIter", len(lens))
         episodes_so_far += len(lens)
         timesteps_so_far += sum(lens)
+        if len(lens) == 0:
+            timesteps_since_last_episode_end += timesteps_per_actorbatch
+            if timesteps_since_last_episode_end > 10000:
+                print("timesteps since last episode ended > 40000 - env learned")
+                break
+        else:
+            timesteps_since_last_episode_end = 0
         iters_so_far += 1
         logger.record_tabular("EpisodesSoFar", episodes_so_far)
         logger.record_tabular("TimestepsSoFar", timesteps_so_far)
