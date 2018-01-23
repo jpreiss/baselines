@@ -207,6 +207,7 @@ def learn(env, policy_func, *,
 
         logger.log("********** Iteration %i ************"%iters_so_far)
 
+        env.sample_sysid()
         seg = seg_gen.__next__()
         add_vtarg_and_adv(env.N, seg, gamma, lam)
 

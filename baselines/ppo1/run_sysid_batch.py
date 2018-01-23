@@ -3,7 +3,7 @@ from baselines.common import set_global_seeds, tf_util as U
 from baselines import bench
 import gym, logging
 from baselines import logger
-import sysid_policy
+import sysid_batch_policy
 
 def train(env_id, num_timesteps, seed):
     from baselines.ppo1 import mlp_policy, mlp_batch_policy, pposgd_sysid, pposgd_simple, pposgd_batch
@@ -34,10 +34,15 @@ def train(env_id, num_timesteps, seed):
         return mlp_batch_policy.MlpPolicy(name=name, ob_space=ob_space, ac_space=ac_space,
             hid_size=64, num_hid_layers=2)
 
+    def sysid_batch_policy_fn(name, ob_space, ac_space):
+        return sysid_batch_policy.SysIDPolicy(name=name, 
+            ob_space=ob_space, ac_space=ac_space, sysid_dim=sysid_dim, latent_dim=3,
+            hid_size=64, n_hid=2)
+
     #env = bench.Monitor(env, logger.get_dir())
     env.seed(seed)
     gym.logger.setLevel(logging.WARN)
-    pposgd_batch.learn(env, mlp_policy_fn,
+    pposgd_batch.learn(env, sysid_batch_policy_fn,
             max_timesteps=num_timesteps,
             timesteps_per_actorbatch=512,
             clip_param=0.1, entcoeff=0.0,
