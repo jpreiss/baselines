@@ -14,6 +14,70 @@ def rolling_window(a, window):
     strides = a.strides + (a.strides[-1],)
     return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
 
+def make_sysid_trajs(pi, env, ob, ac, timesteps_per_actorbatch):
+    N = env.N
+    ob_space = env.observation_space
+    ac_space = env.action_space
+    sysid_dim = env.sysid_dim
+    assert len(ob_space.shape) == 1
+    assert len(ac_space.shape) == 1
+    ob_dim = ob_space.shape[0] - sysid_dim
+    ac_dim = ac_space.shape[0]
+    assert ob.shape == (timesteps_per_actorbatch, N, ob_space.shape[0])
+    assert ac.shape == (timesteps_per_actorbatch, N, ac_space.shape[0])
+    ob_trajs = ob.transpose([1,0,2])
+    ac_trajs = ac.transpose([1,0,2])
+    # just make it "shape check" for now... not dealing with restarts yet
+    traj_len = pi.traj_len
+
+    ob_expanded = []
+    ob_traj_batch = []
+    ac_traj_batch = []
+
+    # traj input should be [batch, window, ob/ac]
+
+    for i in range(N):
+        t_ob = ob_trajs[i,:,:]
+        t_ob_only = t_ob[:,:ob_dim]
+        # t is rollout * ob
+        windows = rolling_window(t_ob_only.T, traj_len).transpose([1,2,0])
+        assert windows.shape[0] < timesteps_per_actorbatch
+        assert windows.shape[1] == traj_len
+        assert windows.shape[2] == ob_dim
+        # windows is < rollout, window, ob
+        ob_traj_batch.append(windows)
+
+        t_ac = ac_trajs[i,:,:]
+        windows = rolling_window(t_ac.T, traj_len).transpose([1,2,0])
+        ac_traj_batch.append(windows)
+
+        # TODO input should be full obs but only check sysid equals
+        n_windows = windows.shape[0]
+        true_sysid = t_ob[0,ob_dim:]
+        #assert np.all(t_ob[:,ob_dim:] == true_sysid)
+        others_same = [np.all(t_ob[j,ob_dim:] == true_sysid)
+            for j in range(timesteps_per_actorbatch)]
+        n_different = timesteps_per_actorbatch - sum(others_same)
+        if n_different > 0:
+            print("agent {}: {}/{} sysids different".format(
+                i, n_different, timesteps_per_actorbatch))
+            where_different = [j for j in range(timesteps_per_actorbatch) if not others_same[j]]
+            print("differences:")
+            for w in where_different:
+                print(w)
+        #assert n_different == 0
+        ob_rep = np.tile(t_ob[0,:], (n_windows, 1))
+        ob_expanded.append(ob_rep)
+
+    ob_traj_batch = np.concatenate(ob_traj_batch, axis=0)
+    ac_traj_batch = np.concatenate(ac_traj_batch, axis=0)
+    ob_rep_batch = np.concatenate(ob_expanded, axis=0)
+    assert(ac_traj_batch.shape[0] == ob_traj_batch.shape[0])
+    assert(ob_rep_batch.shape[0] == ob_traj_batch.shape[0])
+
+    return ob_traj_batch, ac_traj_batch, ob_rep_batch
+
+
 def traj_segment_generator(pi, env, horizon, stochastic):
     t = 0
     N = env.N
@@ -148,6 +212,9 @@ def learn(env, policy_func, *,
     # ----------------------------------------
     ob_space = env.observation_space
     ac_space = env.action_space
+    sysid_dim = env.sysid_dim
+    ob_dim = ob_space.shape[0] - sysid_dim
+    ac_dim = ac_space.shape[0]
     pi = policy_func("pi", ob_space, ac_space) # Construct network for new policy
     oldpi = policy_func("oldpi", ob_space, ac_space) # Network for old policy
     atarg = tf.placeholder(dtype=tf.float32, shape=[None]) # Target advantage function (if applicable)
@@ -235,62 +302,8 @@ def learn(env, policy_func, *,
 
         # slice-n-dice the ob, ac trajectories to get the training data for sysid
         ob, ac, atarg, tdlamret, emb = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"], seg["emb"]
-        sysid_dim = env.sysid_dim
-        assert len(ob_space.shape) == 1
-        assert len(ac_space.shape) == 1
-        ob_dim = ob_space.shape[0] - sysid_dim
-        ac_dim = ac_space.shape[0]
-        assert ob.shape == (timesteps_per_actorbatch, N, ob_space.shape[0])
-        assert ac.shape == (timesteps_per_actorbatch, N, ac_space.shape[0])
-        ob_trajs = ob.transpose([1,0,2])
-        ac_trajs = ac.transpose([1,0,2])
-        # just make it "shape check" for now... not dealing with restarts yet
-        traj_len = pi.traj_len
-
-        ob_expanded = []
-        ob_traj_batch = []
-        ac_traj_batch = []
-
-        # traj input should be [batch, window, ob/ac]
-
-        for i in range(N):
-            t_ob = ob_trajs[i,:,:]
-            t_ob_only = t_ob[:,:ob_dim]
-            # t is rollout * ob
-            windows = rolling_window(t_ob_only.T, traj_len).transpose([1,2,0])
-            assert windows.shape[0] < timesteps_per_actorbatch
-            assert windows.shape[1] == traj_len
-            assert windows.shape[2] == ob_dim
-            # windows is < rollout, window, ob
-            ob_traj_batch.append(windows)
-
-            t_ac = ac_trajs[i,:,:]
-            windows = rolling_window(t_ac.T, traj_len).transpose([1,2,0])
-            ac_traj_batch.append(windows)
-
-            # TODO input should be full obs but only check sysid equals
-            n_windows = windows.shape[0]
-            true_sysid = t_ob[0,ob_dim:]
-            #assert np.all(t_ob[:,ob_dim:] == true_sysid)
-            others_same = [np.all(t_ob[j,ob_dim:] == true_sysid)
-                for j in range(timesteps_per_actorbatch)]
-            n_different = timesteps_per_actorbatch - sum(others_same)
-            if n_different > 0:
-                print("agent {}: {}/{} sysids different".format(
-                    i, n_different, timesteps_per_actorbatch))
-                where_different = [j for j in range(timesteps_per_actorbatch) if not others_same[j]]
-                print("differences:")
-                for w in where_different:
-                    print(w)
-            #assert n_different == 0
-            ob_rep = np.tile(t_ob[0,:], (n_windows, 1))
-            ob_expanded.append(ob_rep)
-
-        ob_traj_batch = np.concatenate(ob_traj_batch, axis=0)
-        ac_traj_batch = np.concatenate(ac_traj_batch, axis=0)
-        ob_rep_batch = np.concatenate(ob_expanded, axis=0)
-        assert(ac_traj_batch.shape[0] == ob_traj_batch.shape[0])
-        assert(ob_rep_batch.shape[0] == ob_traj_batch.shape[0])
+        ob_traj_batch, ac_traj_batch, ob_rep_batch = make_sysid_trajs(
+            pi, env, ob, ac, timesteps_per_actorbatch)
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         seg_flatten_batches(seg)
@@ -298,9 +311,9 @@ def learn(env, policy_func, *,
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
         traj_ob = U.get_placeholder(name="traj_ob",
-            dtype=tf.float32, shape=[None, traj_len, ob_dim])
+            dtype=tf.float32, shape=[None, pi.traj_len, ob_dim])
         traj_ac = U.get_placeholder(name="traj_ac",
-            dtype=tf.float32, shape=[None, traj_len, ac_dim])
+            dtype=tf.float32, shape=[None, pi.traj_len, ac_dim])
 
         d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
         optim_batchsize = optim_batchsize or ob.shape[0]
