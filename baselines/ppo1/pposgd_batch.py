@@ -62,6 +62,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens, "emb" : emb}
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
+            env.sample_sysid()
             ep_rets = []
             ep_lens = []
         i = t % horizon
@@ -153,7 +154,7 @@ def learn(env, policy_func, *,
     ret = tf.placeholder(dtype=tf.float32, shape=[None]) # Empirical return
 
     lrmult = tf.placeholder(name='lrmult', dtype=tf.float32, shape=[]) # learning rate multiplier, updated with schedule
-    clip_param = clip_param * lrmult # Annealed cliping parameter epislon
+    clip_param = clip_param * lrmult # Annealed cliping parameter epsilon
 
     ob = U.get_placeholder_cached(name="ob")
     ac = pi.pdtype.sample_placeholder([None])
@@ -177,6 +178,13 @@ def learn(env, policy_func, *,
     lossandgrad = U.function([ob, ac, atarg, ret, lrmult], losses + [U.flatgrad(total_loss, var_list)])
     adam = MpiAdam(var_list, epsilon=adam_epsilon)
 
+    traj_ob = U.get_placeholder_cached(name="traj_ob")
+    traj_ac = U.get_placeholder_cached(name="traj_ac")
+    lossandgrad_sysid = U.function(
+        [ob, traj_ob, traj_ac, lrmult],
+        [pi.sysid_err_supervised, U.flatgrad(pi.sysid_err_supervised, var_list)])
+    adam_sysid = MpiAdam(var_list, epsilon=adam_epsilon)
+
     assign_old_eq_new = U.function([],[], updates=[tf.assign(oldv, newv)
         for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())])
     compute_losses = U.function([ob, ac, atarg, ret, lrmult], losses)
@@ -184,6 +192,7 @@ def learn(env, policy_func, *,
     U.initialize()
     writer = tf.summary.FileWriter('./board', tf.get_default_session().graph)
     adam.sync()
+    adam_sysid.sync()
 
     # Prepare for rollouts
     # ----------------------------------------
@@ -221,7 +230,6 @@ def learn(env, policy_func, *,
 
         logger.log("********** Iteration %i ************"%iters_so_far)
 
-        env.sample_sysid()
         seg = seg_gen.__next__()
         add_vtarg_and_adv(N, seg, gamma, lam)
 
@@ -233,32 +241,56 @@ def learn(env, policy_func, *,
         ob_dim = ob_space.shape[0] - sysid_dim
         ac_dim = ac_space.shape[0]
         assert ob.shape == (timesteps_per_actorbatch, N, ob_space.shape[0])
-        ob_trajs = ob[:,:,ob_dim:].transpose([1,0,2])
+        assert ac.shape == (timesteps_per_actorbatch, N, ac_space.shape[0])
+        ob_trajs = ob.transpose([1,0,2])
+        ac_trajs = ac.transpose([1,0,2])
         # just make it "shape check" for now... not dealing with restarts yet
         traj_len = pi.traj_len
 
-        all_windows = []
-        all_true_embeds = []
+        ob_expanded = []
+        ob_traj_batch = []
+        ac_traj_batch = []
 
         # traj input should be [batch, window, ob/ac]
 
         for i in range(N):
-            t = ob_trajs[i,:,:]
+            t_ob = ob_trajs[i,:,:]
+            t_ob_only = t_ob[:,:ob_dim]
             # t is rollout * ob
-            windows = rolling_window(t.T, traj_len).transpose([1,2,0])
+            windows = rolling_window(t_ob_only.T, traj_len).transpose([1,2,0])
             assert windows.shape[0] < timesteps_per_actorbatch
             assert windows.shape[1] == traj_len
             assert windows.shape[2] == ob_dim
             # windows is < rollout, window, ob
-            all_windows.append(windows)
-            # embed is N * embed_dim
-            e = np.tile(emb[i,:], (windows.shape[0], 1))
-            all_true_embeds.append(e)
+            ob_traj_batch.append(windows)
 
-        all_windows = np.concatenate(all_windows, axis=0)
-        all_true_embeds = np.concatenate(all_true_embeds, axis=0)
-        assert(all_true_embeds.shape[0] == all_windows.shape[0])
+            t_ac = ac_trajs[i,:,:]
+            windows = rolling_window(t_ac.T, traj_len).transpose([1,2,0])
+            ac_traj_batch.append(windows)
 
+            # TODO input should be full obs but only check sysid equals
+            n_windows = windows.shape[0]
+            true_sysid = t_ob[0,ob_dim:]
+            #assert np.all(t_ob[:,ob_dim:] == true_sysid)
+            others_same = [np.all(t_ob[j,ob_dim:] == true_sysid)
+                for j in range(timesteps_per_actorbatch)]
+            n_different = timesteps_per_actorbatch - sum(others_same)
+            if n_different > 0:
+                print("agent {}: {}/{} sysids different".format(
+                    i, n_different, timesteps_per_actorbatch))
+                where_different = [j for j in range(timesteps_per_actorbatch) if not others_same[j]]
+                print("differences:")
+                for w in where_different:
+                    print(w)
+            #assert n_different == 0
+            ob_rep = np.tile(t_ob[0,:], (n_windows, 1))
+            ob_expanded.append(ob_rep)
+
+        ob_traj_batch = np.concatenate(ob_traj_batch, axis=0)
+        ac_traj_batch = np.concatenate(ac_traj_batch, axis=0)
+        ob_rep_batch = np.concatenate(ob_expanded, axis=0)
+        assert(ac_traj_batch.shape[0] == ob_traj_batch.shape[0])
+        assert(ob_rep_batch.shape[0] == ob_traj_batch.shape[0])
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         seg_flatten_batches(seg)
@@ -281,21 +313,36 @@ def learn(env, policy_func, *,
         # Here we do a bunch of optimization epochs over the data
         for _ in range(optim_epochs):
             losses = [] # list of tuples, each of which gives the loss for a minibatch
+            sysid_losses = []
             for batch in d.iterate_once(optim_batchsize):
                 *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
                 adam.update(g, optim_stepsize * cur_lrmult) 
+
+                *newlosses_sysid, g_sysid = lossandgrad_sysid(
+                    ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
+                adam_sysid.update(g_sysid, optim_stepsize * cur_lrmult)
+
                 losses.append(newlosses)
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
         logger.log("Evaluating losses...")
         losses = []
+        sysid_losses = []
         for batch in d.iterate_once(optim_batchsize):
             newlosses = compute_losses(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
             losses.append(newlosses)            
+            sysid_newlosses, _ = lossandgrad_sysid(
+                ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
+            sysid_losses.append(sysid_newlosses)
         meanlosses,_,_ = mpi_moments(losses, axis=0)
         logger.log(fmt_row(13, meanlosses))
+
         for (lossval, name) in zipsame(meanlosses, loss_names):
             logger.record_tabular("loss_"+name, lossval)
+        meanlosses_sysid, _, _ = mpi_moments(sysid_losses, axis=0)
+        assert len(meanlosses_sysid) == 1
+        logger.record_tabular("SysID loss", meanlosses_sysid[0])
+
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
         lrlocal = (seg["ep_lens"], seg["ep_rets"]) # local values
         listoflrpairs = MPI.COMM_WORLD.allgather(lrlocal) # list of tuples
