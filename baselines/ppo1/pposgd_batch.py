@@ -6,7 +6,16 @@ import time
 from baselines.common.mpi_adam import MpiAdam
 from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
-from collections import deque
+from collections import deque, namedtuple
+
+# ob: observation without sysid added
+# sysid: mass, inertia, etc...
+# ob_concat: ob + sysid
+# ac: action
+# embed: dimensionality of embedding space
+# agents: number of agents in batch environment
+# window: length of rolling window for sysid network input
+Dim = namedtuple('Dim', 'ob sysid ob_concat ac embed agents window')
 
 # reshape array of (..., n) to (..., < n, window)
 def rolling_window(a, window):
@@ -14,7 +23,29 @@ def rolling_window(a, window):
     strides = a.strides + (a.strides[-1],)
     return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
 
-def make_sysid_trajs(pi, env, ob, ac, timesteps_per_actorbatch):
+# new: 1 where a new rollout started, 0 if continuing
+# window_len: the length of input to sysid network
+#
+# returns: a list of indices where we can start a window
+def list_valid_windows(new, window_len):
+    assert len(new.shape) == 1
+    traj_len = new.shape[0]
+    valid_windows = []
+    window_scales = []
+    # note: mutating reference argument!!!
+    new[0] = True
+    starts = np.where(new)[0]
+    run_lens = np.diff(np.append(starts, len(new)))
+    # TODO: vectorize
+    for start, run_len in zip(starts, run_lens):
+        if run_len >= window_len:
+            n_windows = run_len - window_len + 1
+            these_windows = range(start, start + n_windows)
+            valid_windows.extend(these_windows)
+            window_scales.extend(1.0 / n_windows for _ in these_windows)
+    return valid_windows, window_scales
+
+def make_sysid_trajs(pi, env, ob, ac, new):
     N = env.N
     ob_space = env.observation_space
     ac_space = env.action_space
@@ -23,10 +54,13 @@ def make_sysid_trajs(pi, env, ob, ac, timesteps_per_actorbatch):
     assert len(ac_space.shape) == 1
     ob_dim = ob_space.shape[0] - sysid_dim
     ac_dim = ac_space.shape[0]
-    assert ob.shape == (timesteps_per_actorbatch, N, ob_space.shape[0])
-    assert ac.shape == (timesteps_per_actorbatch, N, ac_space.shape[0])
+    timesteps = ob.shape[0]
+    assert ob.shape == (timesteps, N, ob_space.shape[0])
+    assert ac.shape == (timesteps, N, ac_dim)
+    assert new.shape == (timesteps, N)
     ob_trajs = ob.transpose([1,0,2])
     ac_trajs = ac.transpose([1,0,2])
+    new_trajs = new.T
     # just make it "shape check" for now... not dealing with restarts yet
     traj_len = pi.traj_len
 
@@ -35,33 +69,39 @@ def make_sysid_trajs(pi, env, ob, ac, timesteps_per_actorbatch):
     ac_traj_batch = []
 
     # traj input should be [batch, window, ob/ac]
+    all_window_starts = []
+    all_window_scales = []
 
     for i in range(N):
         t_ob = ob_trajs[i,:,:]
         t_ob_only = t_ob[:,:ob_dim]
+
+        window_starts, window_scales = list_valid_windows(new_trajs[i,:], traj_len)
+        all_window_starts.extend((i, s) for s in window_starts)
+        all_window_scales.extend(window_scales)
+
         # t is rollout * ob
         windows = rolling_window(t_ob_only.T, traj_len).transpose([1,2,0])
-        assert windows.shape[0] < timesteps_per_actorbatch
+        assert windows.shape[0] < timesteps
         assert windows.shape[1] == traj_len
         assert windows.shape[2] == ob_dim
         # windows is < rollout, window, ob
-        ob_traj_batch.append(windows)
+        ob_traj_batch.append(windows[window_starts,:,:])
 
         t_ac = ac_trajs[i,:,:]
         windows = rolling_window(t_ac.T, traj_len).transpose([1,2,0])
-        ac_traj_batch.append(windows)
+        ac_traj_batch.append(windows[window_starts,:,:])
 
-        # TODO input should be full obs but only check sysid equals
-        n_windows = windows.shape[0]
+        n_windows = len(window_starts)
         true_sysid = t_ob[0,ob_dim:]
         #assert np.all(t_ob[:,ob_dim:] == true_sysid)
         others_same = [np.all(t_ob[j,ob_dim:] == true_sysid)
-            for j in range(timesteps_per_actorbatch)]
-        n_different = timesteps_per_actorbatch - sum(others_same)
+            for j in range(timesteps)]
+        n_different = timesteps - sum(others_same)
         if n_different > 0:
             print("agent {}: {}/{} sysids different".format(
-                i, n_different, timesteps_per_actorbatch))
-            where_different = [j for j in range(timesteps_per_actorbatch) if not others_same[j]]
+                i, n_different, timesteps))
+            where_different = [j for j in range(timesteps) if not others_same[j]]
             print("differences:")
             for w in where_different:
                 print(w)
@@ -75,8 +115,20 @@ def make_sysid_trajs(pi, env, ob, ac, timesteps_per_actorbatch):
     assert(ac_traj_batch.shape[0] == ob_traj_batch.shape[0])
     assert(ob_rep_batch.shape[0] == ob_traj_batch.shape[0])
 
-    return ob_traj_batch, ac_traj_batch, ob_rep_batch
+    return ob_traj_batch, ac_traj_batch, ob_rep_batch, all_window_starts, all_window_scales
 
+def eval_sysid_errors(pi, ob_traj, ac_traj, ob_rep):
+    # N is not number of agents, but total number of data points
+    N, window, _ = ob_traj.shape
+    assert ac_traj.shape[0:2] == (N, window)
+    assert ob_rep.shape[0] == N
+    sysid_rep = pi.sysid_to_embedded(ob_rep[:,pi.ob_dim:])
+    sysid_estimated = pi.estimate_sysid(ob_traj, ac_traj)
+    assert sysid_estimated.shape == sysid_rep.shape
+    err2 = (sysid_rep - sysid_estimated) ** 2
+    err2 = np.mean(err2, axis=1)
+    assert err2.shape == (N,)
+    return err2
 
 def traj_segment_generator(pi, env, horizon, stochastic):
     t = 0
@@ -117,10 +169,19 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         # before returning segment [0, T-1] so we get the correct
         # terminal value
         if t > 0 and t % horizon == 0:
-            print("YIELDING")
             k_episodes += 1
             true_sysid = env.sysid_values()
             emb = pi.sysid_to_embedded(true_sysid)
+
+            ob_trajs, ac_trajs, ob_reps, window_starts, window_scales = make_sysid_trajs(
+                pi, env, obs, acs, news)
+            err2s = eval_sysid_errors(pi, ob_trajs, ac_trajs, ob_reps)
+            err2s = pi.alpha_sysid * err2s
+            print("err2s mean val:", np.mean(err2s.flatten()))
+            assert len(window_starts) == len(err2s)
+            for j, (agent, ind) in enumerate(window_starts):
+                rews[ind,agent] -= window_scales[j] * err2s[j]
+
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens, "emb" : emb}
@@ -301,9 +362,10 @@ def learn(env, policy_func, *,
         add_vtarg_and_adv(N, seg, gamma, lam)
 
         # slice-n-dice the ob, ac trajectories to get the training data for sysid
-        ob, ac, atarg, tdlamret, emb = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"], seg["emb"]
-        ob_traj_batch, ac_traj_batch, ob_rep_batch = make_sysid_trajs(
-            pi, env, ob, ac, timesteps_per_actorbatch)
+        ob, ac, new, atarg, tdlamret, emb = seg["ob"], seg["ac"], seg["new"], seg["adv"], seg["tdlamret"], seg["emb"]
+        # don't care about indices of the rolling windows anymore, hence ignoring
+        ob_traj_batch, ac_traj_batch, ob_rep_batch, _, _= make_sysid_trajs(
+            pi, env, ob, ac, new)
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         seg_flatten_batches(seg)
