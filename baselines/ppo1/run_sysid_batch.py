@@ -36,9 +36,11 @@ def train(env_id, num_timesteps, seed):
 
     def sysid_batch_policy_fn(name, ob_space, ac_space):
         traj_len = 100
+        latent_dim = 1
         return sysid_batch_policy.SysIDPolicy(name=name, 
-            ob_space=ob_space, ac_space=ac_space, sysid_dim=sysid_dim, latent_dim=3,
-            traj_len=traj_len, hid_size=64, n_hid=2)
+            ob_space=ob_space, ac_space=ac_space, sysid_dim=sysid_dim,
+            latent_dim=latent_dim, traj_len=traj_len,
+            hid_size=64, n_hid=2)
 
     #env = bench.Monitor(env, logger.get_dir())
     env.seed(seed)

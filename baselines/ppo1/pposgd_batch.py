@@ -7,6 +7,8 @@ from baselines.common.mpi_adam import MpiAdam
 from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
 from collections import deque, namedtuple
+from embed_explore import embed_explore
+import matplotlib.pyplot as plt
 
 # ob: observation without sysid added
 # sysid: mass, inertia, etc...
@@ -42,7 +44,7 @@ def list_valid_windows(new, window_len):
             n_windows = run_len - window_len + 1
             these_windows = range(start, start + n_windows)
             valid_windows.extend(these_windows)
-            window_scales.extend(1.0 / n_windows for _ in these_windows)
+            window_scales.extend(1.0 for _ in these_windows)
     return valid_windows, window_scales
 
 def make_sysid_trajs(pi, env, ob, ac, new):
@@ -114,20 +116,53 @@ def make_sysid_trajs(pi, env, ob, ac, new):
     ob_rep_batch = np.concatenate(ob_expanded, axis=0)
     assert(ac_traj_batch.shape[0] == ob_traj_batch.shape[0])
     assert(ob_rep_batch.shape[0] == ob_traj_batch.shape[0])
-
     return ob_traj_batch, ac_traj_batch, ob_rep_batch, all_window_starts, all_window_scales
 
-def eval_sysid_errors(pi, ob_traj, ac_traj, ob_rep):
+def sysid_var_within_traj(sysid_estimated, sysid_rep):
+    N, dim = sysid_rep.shape
+    n_clusters = 0
+    sum_var = 0
+    i = 0
+    j = 0
+    while i < N:
+        si = sysid_rep[i,:]
+        j = i + 1
+        while j < N and np.all(sysid_rep[j,:] == si):
+            j += 1
+        cluster = sysid_estimated[i:j,:]
+        v = np.var(cluster, axis=0)
+        sum_var += v
+        n_clusters += 1
+        i = j
+    return sum_var / n_clusters
+
+
+def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=False):
     # N is not number of agents, but total number of data points
     N, window, _ = ob_traj.shape
     assert ac_traj.shape[0:2] == (N, window)
     assert ob_rep.shape[0] == N
+    n_uniq = len(np.unique(ob_rep[:,pi.ob_dim]))
     sysid_rep = pi.sysid_to_embedded(ob_rep[:,pi.ob_dim:])
+    n_uniq_embed = len(np.unique(sysid_rep[:,0]))
+    #print("n_uniq:", n_uniq, ", n_uniq_embed:", n_uniq_embed)
+    assert n_uniq_embed == 1 or n_uniq == n_uniq_embed
     sysid_estimated = pi.estimate_sysid(ob_traj, ac_traj)
+    var_all = np.var(sysid_estimated, axis=0)
+    var_within = sysid_var_within_traj(sysid_estimated, sysid_rep)
+    print("var_all: {}\nvar_within:{}".format(var_all, var_within))
+    print("mean_true: {}, std_true: {}".format(
+        np.mean(sysid_rep, axis=0), np.std(sysid_rep, axis=0)))
+    print("mean_est: {}, std_est: {}".format(
+        np.mean(sysid_estimated, axis=0), np.std(sysid_estimated, axis=0)))
     assert sysid_estimated.shape == sysid_rep.shape
     err2 = (sysid_rep - sysid_estimated) ** 2
     err2 = np.mean(err2, axis=1)
     assert err2.shape == (N,)
+
+    if plot:
+        embed_explore(env, pi, ob_rep, sysid_rep, sysid_estimated)
+
     return err2
 
 def traj_segment_generator(pi, env, horizon, stochastic):
@@ -171,11 +206,13 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         if t > 0 and t % horizon == 0:
             k_episodes += 1
             true_sysid = env.sysid_values()
-            emb = pi.sysid_to_embedded(true_sysid)
 
             ob_trajs, ac_trajs, ob_reps, window_starts, window_scales = make_sysid_trajs(
                 pi, env, obs, acs, news)
-            err2s = eval_sysid_errors(pi, ob_trajs, ac_trajs, ob_reps)
+
+            plot = k_episodes % 5 == 1
+            #plot = True
+            err2s = eval_sysid_errors(env, pi, ob_trajs, ac_trajs, ob_reps, plot=plot)
             err2s = pi.alpha_sysid * err2s
             print("err2s mean val:", np.mean(err2s.flatten()))
             assert len(window_starts) == len(err2s)
@@ -184,10 +221,12 @@ def traj_segment_generator(pi, env, horizon, stochastic):
 
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
-                    "ep_rets" : ep_rets, "ep_lens" : ep_lens, "emb" : emb}
+                    "ep_rets" : ep_rets, "ep_lens" : ep_lens}
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             env.sample_sysid()
+            sysids = env.sysid_values()
+            embeds = pi.sysid_to_embedded(sysids)
             ep_rets = []
             ep_lens = []
         i = t % horizon
@@ -362,7 +401,7 @@ def learn(env, policy_func, *,
         add_vtarg_and_adv(N, seg, gamma, lam)
 
         # slice-n-dice the ob, ac trajectories to get the training data for sysid
-        ob, ac, new, atarg, tdlamret, emb = seg["ob"], seg["ac"], seg["new"], seg["adv"], seg["tdlamret"], seg["emb"]
+        ob, ac, new, atarg, tdlamret = seg["ob"], seg["ac"], seg["new"], seg["adv"], seg["tdlamret"]
         # don't care about indices of the rolling windows anymore, hence ignoring
         ob_traj_batch, ac_traj_batch, ob_rep_batch, _, _= make_sysid_trajs(
             pi, env, ob, ac, new)
@@ -393,11 +432,16 @@ def learn(env, policy_func, *,
                 *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
                 adam.update(g, optim_stepsize * cur_lrmult) 
 
+                # seems that we need a lower learning rate here - 
+                # perhaps bc the sysid gradient is a less noisy estimate
+                # than the RL policy gradient, so there's less cancellation
+                # due to momentum in Adam
                 *newlosses_sysid, g_sysid = lossandgrad_sysid(
                     ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
-                adam_sysid.update(g_sysid, optim_stepsize * cur_lrmult)
+                adam_sysid.update(g_sysid, 0.3*optim_stepsize * cur_lrmult)
 
                 losses.append(newlosses)
+                sysid_losses.append(newlosses_sysid[0])
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
         logger.log("Evaluating losses...")
@@ -405,7 +449,7 @@ def learn(env, policy_func, *,
         sysid_losses = []
         for batch in d.iterate_once(optim_batchsize):
             newlosses = compute_losses(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
-            losses.append(newlosses)            
+            losses.append(newlosses)
             sysid_newlosses, _ = lossandgrad_sysid(
                 ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
             sysid_losses.append(sysid_newlosses)
@@ -431,8 +475,8 @@ def learn(env, policy_func, *,
         timesteps_so_far += sum(lens)
         if len(lens) == 0:
             timesteps_since_last_episode_end += N * timesteps_per_actorbatch
-            if timesteps_since_last_episode_end > 40000:
-                print("timesteps since last episode ended > 40000 - env learned")
+            if timesteps_since_last_episode_end > 400000:
+                print("timesteps since last episode ended > 400000 - env learned")
                 break
         else:
             timesteps_since_last_episode_end = 0
