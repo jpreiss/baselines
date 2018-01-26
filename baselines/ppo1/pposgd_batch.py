@@ -6,18 +6,9 @@ import time
 from baselines.common.mpi_adam import MpiAdam
 from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
-from collections import deque, namedtuple
+from collections import deque
 from embed_explore import embed_explore
 import matplotlib.pyplot as plt
-
-# ob: observation without sysid added
-# sysid: mass, inertia, etc...
-# ob_concat: ob + sysid
-# ac: action
-# embed: dimensionality of embedding space
-# agents: number of agents in batch environment
-# window: length of rolling window for sysid network input
-Dim = namedtuple('Dim', 'ob sysid ob_concat ac embed agents window')
 
 # reshape array of (..., n) to (..., < n, window)
 def rolling_window(a, window):
@@ -49,22 +40,19 @@ def list_valid_windows(new, window_len):
 
 def make_sysid_trajs(pi, env, ob, ac, new):
     N = env.N
+    dim = pi.dim
     ob_space = env.observation_space
     ac_space = env.action_space
-    sysid_dim = env.sysid_dim
     assert len(ob_space.shape) == 1
     assert len(ac_space.shape) == 1
-    ob_dim = ob_space.shape[0] - sysid_dim
-    ac_dim = ac_space.shape[0]
     timesteps = ob.shape[0]
     assert ob.shape == (timesteps, N, ob_space.shape[0])
-    assert ac.shape == (timesteps, N, ac_dim)
+    assert ac.shape == (timesteps, N, dim.ac)
     assert new.shape == (timesteps, N)
     ob_trajs = ob.transpose([1,0,2])
     ac_trajs = ac.transpose([1,0,2])
     new_trajs = new.T
     # just make it "shape check" for now... not dealing with restarts yet
-    traj_len = pi.traj_len
 
     ob_expanded = []
     ob_traj_batch = []
@@ -76,28 +64,28 @@ def make_sysid_trajs(pi, env, ob, ac, new):
 
     for i in range(N):
         t_ob = ob_trajs[i,:,:]
-        t_ob_only = t_ob[:,:ob_dim]
+        t_ob_only = t_ob[:,:dim.ob]
 
-        window_starts, window_scales = list_valid_windows(new_trajs[i,:], traj_len)
+        window_starts, window_scales = list_valid_windows(new_trajs[i,:], dim.window)
         all_window_starts.extend((i, s) for s in window_starts)
         all_window_scales.extend(window_scales)
 
         # t is rollout * ob
-        windows = rolling_window(t_ob_only.T, traj_len).transpose([1,2,0])
+        windows = rolling_window(t_ob_only.T, dim.window).transpose([1,2,0])
         assert windows.shape[0] < timesteps
-        assert windows.shape[1] == traj_len
-        assert windows.shape[2] == ob_dim
+        assert windows.shape[1] == dim.window
+        assert windows.shape[2] == dim.ob
         # windows is < rollout, window, ob
         ob_traj_batch.append(windows[window_starts,:,:])
 
         t_ac = ac_trajs[i,:,:]
-        windows = rolling_window(t_ac.T, traj_len).transpose([1,2,0])
+        windows = rolling_window(t_ac.T, dim.window).transpose([1,2,0])
         ac_traj_batch.append(windows[window_starts,:,:])
 
         n_windows = len(window_starts)
-        true_sysid = t_ob[0,ob_dim:]
-        #assert np.all(t_ob[:,ob_dim:] == true_sysid)
-        others_same = [np.all(t_ob[j,ob_dim:] == true_sysid)
+        true_sysid = t_ob[0,dim.ob:]
+        #assert np.all(t_ob[:,dim.ob:] == true_sysid)
+        others_same = [np.all(t_ob[j,dim.ob:] == true_sysid)
             for j in range(timesteps)]
         n_different = timesteps - sum(others_same)
         if n_different > 0:
@@ -139,11 +127,12 @@ def sysid_var_within_traj(sysid_estimated, sysid_rep):
 
 def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=False):
     # N is not number of agents, but total number of data points
+    dim = pi.dim
     N, window, _ = ob_traj.shape
     assert ac_traj.shape[0:2] == (N, window)
     assert ob_rep.shape[0] == N
-    n_uniq = len(np.unique(ob_rep[:,pi.ob_dim]))
-    sysid_rep = pi.sysid_to_embedded(ob_rep[:,pi.ob_dim:])
+    n_uniq = len(np.unique(ob_rep[:,dim.ob]))
+    sysid_rep = pi.sysid_to_embedded(ob_rep[:,dim.ob:])
     n_uniq_embed = len(np.unique(sysid_rep[:,0]))
     #print("n_uniq:", n_uniq, ", n_uniq_embed:", n_uniq_embed)
     assert n_uniq_embed == 1 or n_uniq == n_uniq_embed
@@ -166,6 +155,7 @@ def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=False):
     return err2
 
 def traj_segment_generator(pi, env, horizon, stochastic):
+    dim = pi.dim
     t = 0
     N = env.N
     ac = env.action_space.sample() # not used, just so we have the datatype
@@ -178,8 +168,6 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     cur_ep_len = np.zeros(N) # len of current episode
     ep_rets = [] # returns of completed episodes in this segment
     ep_lens = [] # lengths of ...
-
-    latent_dim = pi.latent_dim
 
     # Initialize history arrays
     obs = np.array([ob for _ in range(horizon)])
@@ -312,10 +300,8 @@ def learn(env, policy_func, *,
     # ----------------------------------------
     ob_space = env.observation_space
     ac_space = env.action_space
-    sysid_dim = env.sysid_dim
-    ob_dim = ob_space.shape[0] - sysid_dim
-    ac_dim = ac_space.shape[0]
     pi = policy_func("pi", ob_space, ac_space) # Construct network for new policy
+    dim = pi.dim
     oldpi = policy_func("oldpi", ob_space, ac_space) # Network for old policy
     atarg = tf.placeholder(dtype=tf.float32, shape=[None]) # Target advantage function (if applicable)
     ret = tf.placeholder(dtype=tf.float32, shape=[None]) # Empirical return
@@ -412,9 +398,9 @@ def learn(env, policy_func, *,
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
         traj_ob = U.get_placeholder(name="traj_ob",
-            dtype=tf.float32, shape=[None, pi.traj_len, ob_dim])
+            dtype=tf.float32, shape=[None, dim.window, dim.ob])
         traj_ac = U.get_placeholder(name="traj_ac",
-            dtype=tf.float32, shape=[None, pi.traj_len, ac_dim])
+            dtype=tf.float32, shape=[None, dim.window, dim.ac])
 
         d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
         optim_batchsize = optim_batchsize or ob.shape[0]

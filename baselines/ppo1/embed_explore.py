@@ -8,7 +8,7 @@ def embed_explore(env, pi, ob_reps, sysid_true, sysid_est):
 	# scatter the actual SysID params with the embedding
 	plt.figure(1)
 	plt.clf()
-	sysid_reps = ob_reps[:,pi.ob_dim:]
+	sysid_reps = ob_reps[:,pi.dim.ob:]
 	assert sysid_reps.shape == (N, 4)
 	for i, name in enumerate(env.sysid_params.keys()):
 		plt.subplot(3, 2, i + 1)

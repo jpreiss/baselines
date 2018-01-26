@@ -35,11 +35,19 @@ def train(env_id, num_timesteps, seed):
             hid_size=64, num_hid_layers=2)
 
     def sysid_batch_policy_fn(name, ob_space, ac_space):
-        traj_len = 100
-        latent_dim = 1
-        return sysid_batch_policy.SysIDPolicy(name=name, 
-            ob_space=ob_space, ac_space=ac_space, sysid_dim=sysid_dim,
-            latent_dim=latent_dim, traj_len=traj_len,
+        for space in (ob_space, ac_space):
+            assert isinstance(space, gym.spaces.Box)
+            assert len(space.shape) == 1
+        dim = sysid_batch_policy.Dim(
+            ob = ob_space.shape[0] - sysid_dim,
+            sysid = sysid_dim, # NOTE this is a closure
+            ob_concat = ob_space.shape[0],
+            ac = ac_space.shape[0],
+            embed = 1,
+            agents = 32,
+            window = 100,
+        )
+        return sysid_batch_policy.SysIDPolicy(name=name, dim=dim,
             hid_size=64, n_hid=2)
 
     #env = bench.Monitor(env, logger.get_dir())
