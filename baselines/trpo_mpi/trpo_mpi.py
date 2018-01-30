@@ -31,13 +31,18 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     acs = np.array([ac for _ in range(horizon)])
     prevacs = acs.copy()
 
+    render_every = 10
+    k = 0
     while True:
         prevac = ac
         ac, vpred = pi.act(stochastic, ob)
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
+        if k % render_every == 0:
+            env.render()
         if t > 0 and t % horizon == 0:
+            k += 1
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens}
