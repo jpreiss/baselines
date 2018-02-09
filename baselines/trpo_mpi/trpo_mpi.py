@@ -47,6 +47,9 @@ def traj_segment_generator(pi, env, horizon, stochastic):
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens}
             _, vpred = pi.act(stochastic, ob)
+            if hasattr(env, 'sample_sysid'):
+                print("sampling sysid")
+                env.sample_sysid()
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -88,15 +91,17 @@ def learn(env, policy_fn, *,
         timesteps_per_batch, # what to train on
         max_kl, cg_iters,
         gamma, lam, # advantage estimation
-        entcoeff=0.0,
+        entcoeff=0.03,
         cg_damping=1e-2,
         vf_stepsize=3e-4,
-        vf_iters =3,
+        vf_iters =2,
         max_timesteps=0, max_episodes=0, max_iters=0,  # time constraint
-        callback=None
+        callback=None,
+        logdir=''
         ):
     nworkers = MPI.COMM_WORLD.Get_size()
     rank = MPI.COMM_WORLD.Get_rank()
+    print("rank:", rank)
     np.set_printoptions(precision=3)
     # Setup losses and stuff
     # ----------------------------------------
@@ -189,6 +194,10 @@ def learn(env, policy_fn, *,
     rewbuffer = deque(maxlen=40) # rolling buffer for episode rewards
 
     assert sum([max_iters>0, max_timesteps>0, max_episodes>0])==1
+
+    if logdir != '':
+        print("configuring logger to use", logdir)
+        logger.configure(dir=logdir, format_strs=['stdout', 'csv'])
 
     while True:
         if callback: callback(locals(), globals())
