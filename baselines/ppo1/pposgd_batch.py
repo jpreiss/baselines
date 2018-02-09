@@ -1,8 +1,10 @@
-from baselines.common import Dataset, explained_variance, fmt_row, zipsame
+from baselines.common import Dataset, explained_variance, fmt_row, zipsame, batch_util
 from baselines import logger
 import baselines.common.tf_util as U
 import tensorflow as tf, numpy as np
 import time
+import datetime
+import csv
 from baselines.common.mpi_adam import MpiAdam
 from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
@@ -13,232 +15,6 @@ import matplotlib.pyplot as plt
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]
 
-# reshape array of (..., n) to (..., < n, window)
-def rolling_window(a, window):
-    shape = a.shape[:-1] + (a.shape[-1] - window + 1, window)
-    strides = a.strides + (a.strides[-1],)
-    return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
-
-# new: 1 where a new rollout started, 0 if continuing
-# window_len: the length of input to sysid network
-#
-# returns: a list of indices where we can start a window
-def list_valid_windows(new, window_len):
-    assert len(new.shape) == 1
-    traj_len = new.shape[0]
-    valid_windows = []
-    window_scales = []
-    # note: mutating reference argument!!!
-    new[0] = True
-    starts = np.where(new)[0]
-    run_lens = np.diff(np.append(starts, len(new)))
-    # TODO: vectorize
-    for start, run_len in zip(starts, run_lens):
-        if run_len >= window_len:
-            n_windows = run_len - window_len + 1
-            these_windows = range(start, start + n_windows)
-            valid_windows.extend(these_windows)
-            window_scales.extend(1.0 for _ in these_windows)
-    return valid_windows, window_scales
-
-def make_sysid_trajs(dim, ob, ac, new):
-    N = dim.agents
-    timesteps = ob.shape[0]
-    assert ob.shape == (timesteps, N, dim.ob_concat)
-    assert ac.shape == (timesteps, N, dim.ac)
-    assert new.shape == (timesteps, N)
-    ob_trajs = ob.transpose([1,0,2])
-    ac_trajs = ac.transpose([1,0,2])
-    new_trajs = new.T
-    # just make it "shape check" for now... not dealing with restarts yet
-
-    ob_expanded = []
-    ob_traj_batch = []
-    ac_traj_batch = []
-
-    # traj input should be [batch, window, ob/ac]
-    all_window_starts = []
-    all_window_scales = []
-
-    for i in range(N):
-        t_ob = ob_trajs[i,:,:]
-        t_ob_only = t_ob[:,:dim.ob]
-
-        window_starts, window_scales = list_valid_windows(new_trajs[i,:], dim.window)
-        all_window_starts.extend((i, s) for s in window_starts)
-        all_window_scales.extend(window_scales)
-
-        # t is rollout * ob
-        windows = rolling_window(t_ob_only.T, dim.window).transpose([1,2,0])
-        assert windows.shape[0] < timesteps
-        assert windows.shape[1] == dim.window
-        assert windows.shape[2] == dim.ob
-        # windows is < rollout, window, ob
-        ob_traj_batch.append(windows[window_starts,:,:])
-
-        t_ac = ac_trajs[i,:,:]
-        windows = rolling_window(t_ac.T, dim.window).transpose([1,2,0])
-        ac_traj_batch.append(windows[window_starts,:,:])
-
-        n_windows = len(window_starts)
-        true_sysid = t_ob[0,dim.ob:]
-        #assert np.all(t_ob[:,dim.ob:] == true_sysid)
-        others_same = [np.all(t_ob[j,dim.ob:] == true_sysid)
-            for j in range(timesteps)]
-        n_different = timesteps - sum(others_same)
-        if n_different > 0:
-            print("agent {}: {}/{} sysids different".format(
-                i, n_different, timesteps))
-            where_different = [j for j in range(timesteps) if not others_same[j]]
-            print("differences:")
-            for w in where_different:
-                print(w)
-        #assert n_different == 0
-        ob_rep = np.tile(t_ob[0,:], (n_windows, 1))
-        ob_expanded.append(ob_rep)
-
-    ob_traj_batch = np.concatenate(ob_traj_batch, axis=0)
-    ac_traj_batch = np.concatenate(ac_traj_batch, axis=0)
-    ob_rep_batch = np.concatenate(ob_expanded, axis=0)
-    assert(ac_traj_batch.shape[0] == ob_traj_batch.shape[0])
-    assert(ob_rep_batch.shape[0] == ob_traj_batch.shape[0])
-    return ob_traj_batch, ac_traj_batch, ob_rep_batch, all_window_starts, all_window_scales
-
-def sysid_var_within_traj(sysid_estimated, sysid_rep):
-    N, dim = sysid_rep.shape
-    n_clusters = 0
-    sum_var = 0
-    i = 0
-    j = 0
-    while i < N:
-        si = sysid_rep[i,:]
-        j = i + 1
-        while j < N and np.all(sysid_rep[j,:] == si):
-            j += 1
-        cluster = sysid_estimated[i:j,:]
-        v = np.var(cluster, axis=0)
-        sum_var += v
-        n_clusters += 1
-        i = j
-    return sum_var / n_clusters
-
-
-def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=False):
-    # N is not number of agents, but total number of data points
-    dim = pi.dim
-    N, window, _ = ob_traj.shape
-    assert ac_traj.shape[0:2] == (N, window)
-    assert ob_rep.shape[0] == N
-    n_uniq = len(np.unique(ob_rep[:,dim.ob]))
-    sysid_rep = pi.sysid_to_embedded(ob_rep[:,dim.ob:])
-    n_uniq_embed = len(np.unique(sysid_rep[:,0]))
-    #print("n_uniq:", n_uniq, ", n_uniq_embed:", n_uniq_embed)
-    assert n_uniq_embed == 1 or n_uniq == n_uniq_embed
-    sysid_estimated = pi.estimate_sysid(ob_traj, ac_traj)
-    var_all = np.var(sysid_estimated, axis=0)
-    var_within = sysid_var_within_traj(sysid_estimated, sysid_rep)
-    print("var_all: {}\nvar_within:{}".format(var_all, var_within))
-    print("mean_true: {}, std_true: {}".format(
-        np.mean(sysid_rep, axis=0), np.std(sysid_rep, axis=0)))
-    print("mean_est: {}, std_est: {}".format(
-        np.mean(sysid_estimated, axis=0), np.std(sysid_estimated, axis=0)))
-    assert sysid_estimated.shape == sysid_rep.shape
-    err2 = (sysid_rep - sysid_estimated) ** 2
-    err2 = np.mean(err2, axis=1)
-    assert err2.shape == (N,)
-
-    if plot:
-        embed_explore(env, pi, ob_rep, sysid_rep, sysid_estimated)
-
-    return err2
-
-def traj_segment_generator(pi, env, horizon, stochastic):
-    dim = pi.dim
-    t = 0
-    N = env.N
-    ac = env.action_space.sample() # not used, just so we have the datatype
-    ac = np.tile(ac, (N, 1))
-    new = True # marks if we're on first timestep of an episode
-    ob = env.reset()
-    assert ob.shape[0] == N
-
-    cur_ep_rets = np.zeros(N) # return in current episode
-    cur_ep_len = np.zeros(N) # len of current episode
-    ep_rets = [] # returns of completed episodes in this segment
-    ep_lens = [] # lengths of ...
-
-    # Initialize history arrays
-    obs = np.array([ob for _ in range(horizon)])
-    rews = np.zeros((horizon, N), 'float32')
-    vpreds = np.zeros((horizon, N), 'float32')
-    news = np.zeros((horizon, N), 'int32')
-    acs = np.array([ac for _ in range(horizon)])
-    assert len(acs.shape) == 3
-    assert acs.shape[0] == horizon
-    assert acs.shape[1] == N
-    prevacs = acs.copy()
-
-    k_episodes = 0
-    render_every = 20
-    while True:
-        if k_episodes % render_every == 1:
-            env.render()
-        prevac = ac
-        ac, vpred = pi.act(stochastic, ob)
-
-        # Slight weirdness here because we need value function at time T
-        # before returning segment [0, T-1] so we get the correct
-        # terminal value
-        if t > 0 and t % horizon == 0:
-            k_episodes += 1
-            true_sysid = env.sysid_values()
-
-            ob_trajs, ac_trajs, ob_reps, window_starts, window_scales = make_sysid_trajs(
-                pi.dim, obs, acs, news)
-
-            plot = k_episodes % 5 == 1
-            #plot = True
-            err2s = eval_sysid_errors(env, pi, ob_trajs, ac_trajs, ob_reps, plot=plot)
-            err2s = pi.alpha_sysid * err2s
-            print("err2s mean val:", np.mean(err2s.flatten()))
-            assert len(window_starts) == len(err2s)
-            for j, (agent, ind) in enumerate(window_starts):
-                rews[ind,agent] -= window_scales[j] * err2s[j]
-
-            # yield the batch to PPO
-            yield {
-                "ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
-                "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
-                "ep_rets" : ep_rets, "ep_lens" : ep_lens,
-                "ob_trajs" : ob_trajs, "ac_trajs" : ac_trajs, "ob_reps": ob_reps,
-            }
-
-            # Be careful!!! if you change the downstream algorithm to aggregate
-            # several of these batches, then be sure to do a deepcopy
-            env.sample_sysid()
-            sysids = env.sysid_values()
-            embeds = pi.sysid_to_embedded(sysids)
-            ep_rets = []
-            ep_lens = []
-        i = t % horizon
-        obs[i,:,:] = ob
-        vpreds[i,:] = vpred
-        news[i,:] = new
-        acs[i,:,:] = ac
-        prevacs[i,:,:] = prevac
-
-        ob, rew, new, _ = env.step(ac)
-        rews[i,:] = rew
-
-        cur_ep_rets += rew
-        cur_ep_len += 1
-        new_rets = cur_ep_rets[new]
-        new_lens = cur_ep_len[new]
-        ep_rets.extend(new_rets)
-        ep_lens.extend(new_lens)
-        cur_ep_rets[new] = 0
-        cur_ep_len[new] = 0
-        t += 1
 
 def vtarg_and_adv_1d(rew, new, vpred, nextvpred, gamma, lam):
     new = np.append(new, 0) # last element is only used for last vtarg, but we already zeroed it if last new = 1
@@ -319,21 +95,21 @@ def learn(env, policy_func, *,
 
     # KL divergence not actually part of PPO, only computed for logging
     kloldnew = oldpi.pd.kl(pi.pd)
-    meankl = U.mean(kloldnew)
+    meankl = tf.reduce_mean(kloldnew)
 
     # policy entropy & regularization
     ent = pi.pd.entropy()
-    meanent = U.mean(ent)
+    meanent = tf.reduce_mean(ent)
     pol_entpen = (-entcoeff) * meanent
 
     # construct PPO's pessimistic surrogate loss (L^CLIP)
     ratio = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac))
     surr1 = ratio * atarg
-    surr2 = U.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
-    pol_surr = - U.mean(tf.minimum(surr1, surr2))
+    surr2 = tf.clip_by_value(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
+    pol_surr = - tf.reduce_mean(tf.minimum(surr1, surr2))
 
     # value function loss
-    vf_loss = U.mean(tf.square(pi.vpred - ret))
+    vf_loss = tf.reduce_mean(tf.square(pi.vpred - ret))
 
     # total loss for reinforcement learning
     total_loss = pol_surr + pol_entpen + vf_loss
@@ -368,7 +144,7 @@ def learn(env, policy_func, *,
     writer = tf.summary.FileWriter('./board', tf.get_default_session().graph)
     adam.sync()
     adam_sysid.sync()
-    seg_gen = traj_segment_generator(pi, env, timesteps_per_actorbatch, stochastic=True)
+    seg_gen = batch_util.traj_segment_generator(pi, env, timesteps_per_actorbatch, stochastic=True)
 
     episodes_so_far = 0
     timesteps_so_far = 0
@@ -381,14 +157,28 @@ def learn(env, policy_func, *,
     assert sum([max_iters > 0, max_timesteps > 0, max_episodes > 0, max_seconds > 0]) == 1, \
         "Only one time constraint permitted"
 
+    csvpath = './ppobatch_log_' + str(datetime.datetime.now()) + '.csv'
+    csvfile = open(csvpath, 'w', newline='')
+    csvwriter = csv.writer(csvfile)
+    def logrow(row):
+        csvwriter.writerow(row)
+        csvfile.flush()
+    logrow(['reward', 'episode_len', 'n_episodes'] + loss_names)
+
     while True:
         if callback: callback(locals(), globals())
-        if any([
-            max_timesteps and timesteps_so_far >= max_timesteps,
-            max_episodes and episodes_so_far >= max_episodes,
-            max_iters and iters_so_far >= max_iters,
-            max_seconds and time.time() - tstart >= max_seconds
-        ]): break
+        if max_timesteps and timesteps_so_far >= max_timesteps:
+            print("breaking due to max timesteps")
+            break
+        if max_episodes and episodes_so_far >= max_episodes:
+            print("breaking due to max episodes")
+            break
+        if max_iters and iters_so_far >= max_iters:
+            print("breaking due to max iters")
+            break
+        if max_seconds and time.time() - tstart >= max_seconds:
+            print("breaking due to max seconds")
+            break
 
         if schedule == 'constant':
             cur_lrmult = 1.0
@@ -407,6 +197,12 @@ def learn(env, policy_func, *,
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
         ob_traj_batch, ac_traj_batch, ob_rep_batch = seg["ob_trajs"], seg["ac_trajs"], seg["ob_reps"]
 
+        #for k, v in seg.items():
+            #try:
+                #print(k, ":", v.shape)
+            #except AttributeError:
+                #print(k, ": not a np.array")
+
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
 
@@ -415,9 +211,11 @@ def learn(env, policy_func, *,
 
         # Dataset object handles minibatching for SGD
         d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
-        optim_batchsize = optim_batchsize or ob.shape[0]
+        optim_batchsize = min((optim_batchsize or 2048), ob.shape[0])
 
+        print("optim_batchsize:", optim_batchsize)
         logger.log("Optimizing...")
+        #np.seterr(all='raise')
         logger.log(fmt_row(13, loss_names))
 
         # Here we do a bunch of optimization epochs over the data
@@ -427,17 +225,18 @@ def learn(env, policy_func, *,
             for batch in d.iterate_once(optim_batchsize):
                 *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
                 adam.update(g, optim_stepsize * cur_lrmult) 
-
-                # seems that we need a lower learning rate here - 
-                # perhaps bc the sysid gradient is a less noisy estimate
-                # than the RL policy gradient, so there's less cancellation
-                # due to momentum in Adam
-                *newlosses_sysid, g_sysid = lossandgrad_sysid(
-                    ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
-                adam_sysid.update(g_sysid, 0.3*optim_stepsize * cur_lrmult)
-
                 losses.append(newlosses)
-                sysid_losses.append(newlosses_sysid[0])
+
+                if ob_rep_batch.size > 0:
+                    # seems that we need a lower learning rate here - 
+                    # perhaps bc the sysid gradient is a less noisy estimate
+                    # than the RL policy gradient, so there's less cancellation
+                    # due to momentum in Adam
+                    *newlosses_sysid, g_sysid = lossandgrad_sysid(
+                        ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
+                    adam_sysid.update(g_sysid, 0.3*optim_stepsize * cur_lrmult)
+                    sysid_losses.append(newlosses_sysid[0])
+
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
         logger.log("Evaluating losses...")
@@ -450,15 +249,20 @@ def learn(env, policy_func, *,
             newlosses = compute_losses(
                 batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
             losses.append(newlosses)
-            sysid_newlosses, _ = lossandgrad_sysid(
-                ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
-            sysid_losses.append(sysid_newlosses)
+            if ob_rep_batch.size > 0:
+                sysid_newlosses, _ = lossandgrad_sysid(
+                    ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
+                sysid_losses.append(sysid_newlosses)
         meanlosses,_,_ = mpi_moments(losses, axis=0)
         logger.log(fmt_row(13, meanlosses))
 
         for (lossval, name) in zipsame(meanlosses, loss_names):
             logger.record_tabular("loss_"+name, lossval)
-        meanlosses_sysid, _, _ = mpi_moments(sysid_losses, axis=0)
+
+        meanlosses_sysid = [-1]
+        if len(sysid_losses) > 0:
+            meanlosses_sysid, _, _ = mpi_moments(sysid_losses, axis=0)
+        meanlosses_sysid = np.atleast_1d(meanlosses_sysid)
         assert len(meanlosses_sysid) == 1
         logger.record_tabular("SysID loss", meanlosses_sysid[0])
 
@@ -481,11 +285,15 @@ def learn(env, policy_func, *,
         if MPI.COMM_WORLD.Get_rank()==0:
             logger.dump_tabular()
 
+        meanlen = np.mean(lenbuffer)
+        meanrew = np.mean(rewbuffer)
+        logrow([meanrew, meanlen, len(lens)] + list(meanlosses))
+
         # check our simple criteria for "solving" the environment
         if len(lens) == 0:
             timesteps_since_last_episode_end += N * timesteps_per_actorbatch
-            if timesteps_since_last_episode_end > 400000:
-                print("timesteps since last episode ended > 400000 - env learned")
-                break
+            #if timesteps_since_last_episode_end > 400000:
+                #print("timesteps since last episode ended > 400000 - env learned")
+                #break
         else:
             timesteps_since_last_episode_end = 0
