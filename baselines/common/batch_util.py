@@ -112,7 +112,7 @@ def sysid_var_within_traj(sysid_estimated, sysid_rep):
     return sum_var / n_clusters
 
 
-def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=False):
+def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=True):
     # N is not number of agents, but total number of data points
     if ob_traj.size == 0:
         return np.array([])
@@ -129,14 +129,18 @@ def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=False):
     if sysid_estimated is None:
         # policy is just taking true parameters directly
         err2 = np.zeros(N)
+        assert False
     else:
-        var_all = np.var(sysid_estimated, axis=0)
-        var_within = sysid_var_within_traj(sysid_estimated, sysid_rep)
-        print("var_all: {}\nvar_within:{}".format(var_all, var_within))
+        std_all = np.std(sysid_estimated, axis=0)
+        std_within = np.sqrt(sysid_var_within_traj(sysid_estimated, sysid_rep))
+        print("std_all: {}\nstd_within:{}".format(std_all, std_within))
         print("mean_true: {}, std_true: {}".format(
             np.mean(sysid_rep, axis=0), np.std(sysid_rep, axis=0)))
         print("mean_est: {}, std_est: {}".format(
             np.mean(sysid_estimated, axis=0), np.std(sysid_estimated, axis=0)))
+        if plot:
+            csvrows = np.concatenate([sysid_rep, sysid_estimated], axis=1)
+            np.savetxt('sysid_scatter.csv', csvrows)
         assert sysid_estimated.shape == sysid_rep.shape
         err2 = (sysid_rep - sysid_estimated) ** 2
         err2 = np.mean(err2, axis=1)
@@ -236,3 +240,37 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         cur_ep_rets[new] = 0
         cur_ep_len[new] = 0
         t += 1
+
+
+def add_vtarg_and_adv(N, seg, gamma, lam):
+
+    def vtarg_and_adv_1d(rew, new, vpred, nextvpred):
+        new = np.append(new, 0) # last element is only used for last vtarg, but we already zeroed it if last new = 1
+        vpred = np.append(vpred, nextvpred)
+        T = len(rew)
+        adv = gaelam = np.empty(T, 'float32')
+        lastgaelam = 0
+        for t in reversed(range(T)):
+            nonterminal = 1-new[t+1]
+            delta = rew[t] + gamma * vpred[t+1] * nonterminal - vpred[t]
+            gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        tdlamret = adv + vpred[1:]
+        return tdlamret, adv
+
+    new, vpred, nextvpred, rew = seg["new"], seg["vpred"], seg["nextvpred"], seg["rew"]
+    k = rew.shape[0]
+    tdlamret = np.empty((k,N))
+    gaelam = np.empty((k,N))
+    for i in range(N):
+        tdlamret[:,i], gaelam[:,i] = vtarg_and_adv_1d(
+            rew[:,i], new[:,i], vpred[:,i], nextvpred[i])
+    seg["tdlamret"] = tdlamret
+    seg["adv"] = gaelam 
+
+
+def seg_flatten_batches(seg):
+    for s in ("ob", "ac", "adv", "tdlamret", "vpred"):
+        sh = seg[s].shape
+        newshape = [sh[0] * sh[1]] + list(sh[2:])
+        seg[s] = np.reshape(seg[s], newshape)
+
