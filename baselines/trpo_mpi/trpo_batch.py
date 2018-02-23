@@ -3,8 +3,8 @@ from baselines import logger
 import baselines.common.tf_util as U
 import tensorflow as tf, numpy as np
 import time
-from baselines.common import colorize
 from mpi4py import MPI
+from baselines.common import colorize
 from collections import deque
 from baselines.common.mpi_adam import MpiAdam
 from baselines.common.cg import cg
@@ -14,18 +14,17 @@ def learn(env, policy_fn, *,
         timesteps_per_batch, # what to train on
         max_kl, cg_iters,
         gamma, lam, # advantage estimation
-        entcoeff=0.01,
+        entcoeff=0.03,
         cg_damping=1e-2,
         vf_stepsize=3e-4,
         vf_iters =1,
         max_timesteps=0, max_episodes=0, max_iters=0,  # time constraint
-        callback=None
+        callback=None,
+        logdir=None
         ):
 
     N = env.N
 
-    nworkers = MPI.COMM_WORLD.Get_size()
-    rank = MPI.COMM_WORLD.Get_rank()
     np.set_printoptions(precision=3)
     # Setup losses and stuff
     # ----------------------------------------
@@ -51,8 +50,10 @@ def learn(env, policy_fn, *,
     surrgain = tf.reduce_mean(ratio * atarg)
 
     optimgain = surrgain + entbonus
-    losses = [optimgain, meankl, entbonus, surrgain, meanent]
-    loss_names = ["optimgain", "meankl", "entloss", "surrgain", "entropy"]
+    if pi.extra_rewards:
+        optimgain += tf.add_n(pi.extra_rewards)
+    losses = [optimgain, meankl, entbonus, surrgain, meanent] + pi.extra_rewards
+    loss_names = ["optimgain", "meankl", "entloss", "surrgain", "entropy"] + pi.extra_reward_names
 
     dist = meankl
 
@@ -60,6 +61,13 @@ def learn(env, policy_fn, *,
     var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("pol")]
     vf_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("vf")]
     sysid_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("sysid")]
+    if False:
+        for vl in [all_var_list, var_list, vf_var_list, sysid_var_list]:
+            print("----")
+            for v in vl:
+                print(v.name)
+        print("----")
+
     vfadam = MpiAdam(vf_var_list)
 
     def n_params(vars):
@@ -90,28 +98,27 @@ def learn(env, policy_fn, *,
 
     # gradient and Adam optimizer for SysID network
     # they are separate so we can use different learning rate schedules, etc.
-    traj_ob = U.get_placeholder_cached(name="traj_ob")
-    traj_ac = U.get_placeholder_cached(name="traj_ac")
-    lossandgrad_sysid = U.function(
-        [ob, traj_ob, traj_ac],
-        [pi.sysid_err_supervised, U.flatgrad(pi.sysid_err_supervised, sysid_var_list)])
-    adam_sysid = MpiAdam(sysid_var_list)
+    has_sysid = sysid_var_list != []
+    if has_sysid:
+        ob_traj = U.get_placeholder_cached(name="ob_traj")
+        ac_traj = U.get_placeholder_cached(name="ac_traj")
+        lossandgrad_sysid = U.function(
+            [ob, ob_traj, ac_traj],
+            [pi.sysid_err_supervised, U.flatgrad(pi.sysid_err_supervised, sysid_var_list)])
+        adam_sysid = MpiAdam(sysid_var_list)
 
     @contextmanager
     def timed(msg):
-        if rank == 0:
-            print(colorize(msg, color='magenta'))
-            tstart = time.time()
-            yield
-            print(colorize("done in %.3f seconds"%(time.time() - tstart), color='magenta'))
-        else:
-            yield
+        #print(colorize(msg, color='magenta'))
+        #tstart = time.time()
+        yield
+        #print(colorize("done in %.3f seconds"%(time.time() - tstart), color='magenta'))
 
     def allmean(x):
         assert isinstance(x, np.ndarray)
         out = np.empty_like(x)
         MPI.COMM_WORLD.Allreduce(x, out, op=MPI.SUM)
-        out /= nworkers
+        #out /= nworkers
         return out
 
     U.initialize()
@@ -119,7 +126,6 @@ def learn(env, policy_fn, *,
     MPI.COMM_WORLD.Bcast(th_init, root=0)
     set_from_flat(th_init)
     vfadam.sync()
-    print("Init param sum", th_init.sum(), flush=True)
 
     # Prepare for rollouts
     # ----------------------------------------
@@ -133,6 +139,10 @@ def learn(env, policy_fn, *,
     rewbuffer = deque(maxlen=40) # rolling buffer for episode rewards
 
     assert sum([max_iters>0, max_timesteps>0, max_episodes>0])==1
+
+    if logdir != '':
+        #print("configuring logger to use", logdir)
+        logger.configure(dir=logdir, format_strs=['stdout', 'csv'])
 
     while True:
         if callback: callback(locals(), globals())
@@ -172,7 +182,7 @@ def learn(env, policy_fn, *,
             logger.log("Got zero gradient. not updating")
         else:
             with timed("cg"):
-                stepdir = cg(fisher_vector_product, g, cg_iters=cg_iters, verbose=rank==0)
+                stepdir = cg(fisher_vector_product, g, cg_iters=cg_iters, verbose=True)
             assert np.isfinite(stepdir).all()
             shs = .5*stepdir.dot(fisher_vector_product(stepdir))
             lm = np.sqrt(shs / max_kl)
@@ -201,22 +211,23 @@ def learn(env, policy_fn, *,
             else:
                 logger.log("couldn't compute a good step")
                 set_from_flat(thbefore)
-            if nworkers > 1 and iters_so_far % 20 == 0:
-                paramsums = MPI.COMM_WORLD.allgather((thnew.sum(), vfadam.getflat().sum())) # list of tuples
-                assert all(np.allclose(ps, paramsums[0]) for ps in paramsums[1:])
+            #if nworkers > 1 and iters_so_far % 20 == 0:
+                #paramsums = MPI.COMM_WORLD.allgather((thnew.sum(), vfadam.getflat().sum())) # list of tuples
+                #assert all(np.allclose(ps, paramsums[0]) for ps in paramsums[1:])
 
         for (lossname, lossval) in zip(loss_names, meanlosses):
             logger.record_tabular(lossname, lossval)
 
-        with timed("sysid"):
-            for _ in range(4*vf_iters):
-                *newlosses_sysid, g_sysid = lossandgrad_sysid(
-                    ob_rep_batch, ob_traj_batch, ac_traj_batch)
-                adam_sysid.update(g_sysid, vf_stepsize)
-#                sysid_loss_iters.append(newlosses_sysid[0])
-        loss_sysid, _ = lossandgrad_sysid(
-                    ob_rep_batch, ob_traj_batch, ac_traj_batch)
-        logger.record_tabular("loss_sysid", loss_sysid)
+        if has_sysid:
+            with timed("sysid"):
+                for _ in range(4*vf_iters):
+                    *newlosses_sysid, g_sysid = lossandgrad_sysid(
+                        ob_rep_batch, ob_traj_batch, ac_traj_batch)
+                    adam_sysid.update(g_sysid, vf_stepsize)
+    #                sysid_loss_iters.append(newlosses_sysid[0])
+            loss_sysid, _ = lossandgrad_sysid(
+                        ob_rep_batch, ob_traj_batch, ac_traj_batch)
+            logger.record_tabular("loss_sysid", loss_sysid)
 
         with timed("vf"):
             for _ in range(vf_iters):
@@ -244,8 +255,9 @@ def learn(env, policy_fn, *,
         logger.record_tabular("TimestepsSoFar", timesteps_so_far)
         logger.record_tabular("TimeElapsed", time.time() - tstart)
 
-        if rank==0:
-            logger.dump_tabular()
+        logger.dump_tabular()
+
+    return pi
 
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]

@@ -31,8 +31,8 @@ def list_valid_windows(new, window_len):
 def make_sysid_trajs(dim, ob, ac, new):
     N = dim.agents
     timesteps = ob.shape[0]
-    print("ob_shape:",ob.shape)
-    print("N, ob_concat:", N, dim.ob_concat)
+    #print("ob_shape:",ob.shape)
+    #print("N, ob_concat:", N, dim.ob_concat)
     assert ob.shape == (timesteps, N, dim.ob_concat)
     assert ac.shape == (timesteps, N, dim.ac)
     assert new.shape == (timesteps, N)
@@ -75,13 +75,13 @@ def make_sysid_trajs(dim, ob, ac, new):
         others_same = [np.all(t_ob[j,dim.ob:] == true_sysid)
             for j in range(timesteps)]
         n_different = timesteps - sum(others_same)
-        if n_different > 0:
-            print("agent {}: {}/{} sysids different".format(
-                i, n_different, timesteps))
-            where_different = [j for j in range(timesteps) if not others_same[j]]
-            print("differences:")
-            for w in where_different:
-                print(w)
+        #if n_different > 0:
+            #print("agent {}: {}/{} sysids different".format(
+                #i, n_different, timesteps))
+            #where_different = [j for j in range(timesteps) if not others_same[j]]
+            #print("differences:")
+            #for w in where_different:
+                #print(w)
         #assert n_different == 0
         ob_rep = np.tile(t_ob[0,:], (n_windows, 1))
         ob_expanded.append(ob_rep)
@@ -126,29 +126,27 @@ def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=True):
     #print("n_uniq:", n_uniq, ", n_uniq_embed:", n_uniq_embed)
     assert n_uniq_embed == 1 or n_uniq == n_uniq_embed
     sysid_estimated = pi.estimate_sysid(ob_traj, ac_traj)
-    if sysid_estimated is None:
-        # policy is just taking true parameters directly
-        err2 = np.zeros(N)
-        assert False
-    else:
-        std_all = np.std(sysid_estimated, axis=0)
-        std_within = np.sqrt(sysid_var_within_traj(sysid_estimated, sysid_rep))
-        print("std_all: {}\nstd_within:{}".format(std_all, std_within))
-        print("mean_true: {}, std_true: {}".format(
-            np.mean(sysid_rep, axis=0), np.std(sysid_rep, axis=0)))
-        print("mean_est: {}, std_est: {}".format(
-            np.mean(sysid_estimated, axis=0), np.std(sysid_estimated, axis=0)))
-        if plot:
-            csvrows = np.concatenate([sysid_rep, sysid_estimated], axis=1)
-            np.savetxt('sysid_scatter.csv', csvrows)
-        assert sysid_estimated.shape == sysid_rep.shape
-        err2 = (sysid_rep - sysid_estimated) ** 2
-        err2 = np.mean(err2, axis=1)
+
+    std_all = np.std(sysid_estimated, axis=0)
+    std_within = np.sqrt(sysid_var_within_traj(sysid_estimated, sysid_rep))
+    #print("std_all: {}\nstd_within:{}".format(std_all, std_within))
+    #print("mean_true: {}, std_true: {}".format(
+        #np.mean(sysid_rep, axis=0), np.std(sysid_rep, axis=0)))
+    #print("mean_est: {}, std_est: {}".format(
+        #np.mean(sysid_estimated, axis=0), np.std(sysid_estimated, axis=0)))
+
+    if plot:
+        csvrows = np.concatenate([sysid_rep, sysid_estimated], axis=1)
+        np.savetxt('sysid_scatter.csv', csvrows)
+
+    assert sysid_estimated.shape == sysid_rep.shape
+    err2 = (sysid_rep - sysid_estimated) ** 2
+    err2 = np.mean(err2, axis=1)
 
     assert err2.shape == (N,)
     return err2
 
-def traj_segment_generator(pi, env, horizon, stochastic):
+def traj_segment_generator(pi, env, horizon, stochastic, test=False):
     dim = pi.dim
     t = 0
     N = env.N
@@ -174,13 +172,21 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     assert acs.shape[1] == N
     prevacs = acs.copy()
 
+    if test:
+        ob_traj_input = np.zeros((N, dim.window, dim.ob))
+        ac_traj_input = np.zeros((N, dim.window, dim.ac))
+
     k_episodes = 0
     render_every = 10
     while True:
         if k_episodes % render_every == 0:
-            env.render()
+            pass
+            #env.render()
         prevac = ac
-        ac, vpred = pi.act(stochastic, ob)
+        if test:
+            ac, vpred = pi.act_traj(stochastic, ob, ob_traj_input, ac_traj_input)
+        else:
+            ac, vpred = pi.act(stochastic, ob)
 
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
@@ -198,8 +204,8 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             #plot = True
             err2s = eval_sysid_errors(env, pi, ob_trajs, ac_trajs, ob_reps, plot=plot)
             err2s = pi.alpha_sysid * err2s
-            if err2s.size > 0:
-                print("err2s mean val:", np.mean(err2s.flatten()))
+            #if err2s.size > 0:
+                #print("err2s mean val:", np.mean(err2s.flatten()))
             assert len(window_starts) == len(err2s)
             for j, (agent, ind) in enumerate(window_starts):
                 rews[ind,agent] -= window_scales[j] * err2s[j]
@@ -220,6 +226,9 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             embeds = pi.sysid_to_embedded(sysids)
             ep_rets = []
             ep_lens = []
+            if test:
+                ob_traj_input *= 0
+                ac_traj_input *= 0
 
         i = t % horizon
         obs[i,:,:] = ob
@@ -227,6 +236,12 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         news[i,:] = new
         acs[i,:,:] = ac
         prevacs[i,:,:] = prevac
+
+        if test:
+            ob_traj_input = np.roll(ob_traj_input, -1, axis=1)
+            ac_traj_input = np.roll(ac_traj_input, -1, axis=1)
+            ob_traj_input[:,-1,:] = ob[:,:dim.ob]
+            ac_traj_input[:,-1,:] = ac
 
         ob, rew, new, _ = env.step(ac)
         rews[i,:] = rew

@@ -246,7 +246,12 @@ class GetFlat(object):
 
 _PLACEHOLDER_CACHE = {}  # name -> (placeholder, dtype, shape)
 
+def flush_placeholders():
+    global _PLACEHOLDER_CACHE
+    _PLACEHOLDER_CACHE.clear()
+
 def get_placeholder(name, dtype, shape):
+    global _PLACEHOLDER_CACHE
     if name in _PLACEHOLDER_CACHE:
         out, dtype1, shape1 = _PLACEHOLDER_CACHE[name]
         assert dtype1 == dtype and shape1 == shape
