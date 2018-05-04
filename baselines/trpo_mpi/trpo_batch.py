@@ -10,11 +10,15 @@ from baselines.common.mpi_adam import MpiAdam
 from baselines.common.cg import cg
 from contextlib import contextmanager
 
+def printstats(var, name):
+    print("{}: mean={:3f}, std={:3f}, min={:3f}, max={:3f}".format(
+        name, np.mean(var), np.std(var), np.min(var), np.max(var)))
+
 def learn(env, policy_fn, *,
         timesteps_per_batch, # what to train on
         max_kl, cg_iters,
         gamma, lam, # advantage estimation
-        entcoeff=0.03,
+        entcoeff=0.01,
         cg_damping=1e-2,
         vf_stepsize=3e-4,
         vf_iters =1,
@@ -49,7 +53,13 @@ def learn(env, policy_fn, *,
     ratio = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac)) # advantage * pnew / pold
     surrgain = tf.reduce_mean(ratio * atarg)
 
-    optimgain = surrgain + entbonus
+    all_var_list = pi.get_trainable_variables()
+    var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("pol")]
+    vf_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("vf")]
+    sysid_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("sysid")]
+
+    optimgain = surrgain + entbonus - (
+        0.002 * tf.reduce_mean([tf.nn.l2_loss(v) for v in var_list]))
     if pi.extra_rewards:
         optimgain += tf.add_n(pi.extra_rewards)
     losses = [optimgain, meankl, entbonus, surrgain, meanent] + pi.extra_rewards
@@ -57,15 +67,15 @@ def learn(env, policy_fn, *,
 
     dist = meankl
 
-    all_var_list = pi.get_trainable_variables()
-    var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("pol")]
-    vf_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("vf")]
-    sysid_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("sysid")]
     if False:
-        for vl in [all_var_list, var_list, vf_var_list, sysid_var_list]:
+        for vl in [var_list]:
             print("----")
+            cumsum = 0
             for v in vl:
                 print(v.name)
+                print(v.shape)
+                cumsum += np.product([d.value for d in v.shape])
+                print("cumsum =", cumsum)
         print("----")
 
     vfadam = MpiAdam(vf_var_list)
@@ -92,7 +102,8 @@ def learn(env, policy_fn, *,
     assign_old_eq_new = U.function([],[], updates=[tf.assign(oldv, newv)
         for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())])
     compute_losses = U.function([ob, ac, atarg], losses)
-    compute_lossandgrad = U.function([ob, ac, atarg], losses + [U.flatgrad(optimgain, var_list)])
+    compute_lossandgrad = U.function([ob, ac, atarg], losses + 
+        [tf.clip_by_value(U.flatgrad(optimgain, var_list), -0.1, 0.1)])
     compute_fvp = U.function([flat_tangent, ob, ac, atarg], fvp)
     compute_vflossandgrad = U.function([ob, ret], U.flatgrad(vferr, vf_var_list))
 
@@ -135,8 +146,8 @@ def learn(env, policy_fn, *,
     timesteps_so_far = 0
     iters_so_far = 0
     tstart = time.time()
-    lenbuffer = deque(maxlen=40) # rolling buffer for episode lengths
-    rewbuffer = deque(maxlen=40) # rolling buffer for episode rewards
+    lenbuffer = deque(maxlen=1) # rolling buffer for episode lengths
+    rewbuffer = deque(maxlen=1) # rolling buffer for episode rewards
 
     assert sum([max_iters>0, max_timesteps>0, max_episodes>0])==1
 
@@ -161,8 +172,10 @@ def learn(env, policy_fn, *,
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
+        printstats(ac, "actions")
         ob_traj_batch, ac_traj_batch, ob_rep_batch = seg["ob_trajs"], seg["ac_trajs"], seg["ob_reps"]
         vpredbefore = seg["vpred"] # predicted value function before udpate
+        printstats(atarg, "atarg")
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
 
         if hasattr(pi, "ret_rms"): pi.ret_rms.update(tdlamret)
@@ -177,6 +190,12 @@ def learn(env, policy_fn, *,
         with timed("computegrad"):
             *lossbefore, g = compute_lossandgrad(*args)
         lossbefore = allmean(np.array(lossbefore))
+        if True:
+            print("abs(gradient) diagnostics:")
+            gabs = np.abs(g.flat)
+            print("max =", np.max(gabs))
+            print("min =", np.min(gabs))
+            print("mean =", np.mean(gabs))
         g = allmean(g)
         if np.allclose(g, 0):
             logger.log("Got zero gradient. not updating")
