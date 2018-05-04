@@ -1,4 +1,5 @@
 import numpy as np
+from plot_sysid import plot_sysid
 
 # reshape array of (..., n) to (..., < n, window)
 def _rolling_window(a, window):
@@ -112,41 +113,23 @@ def sysid_var_within_traj(sysid_estimated, sysid_rep):
     return sum_var / n_clusters
 
 
-def eval_sysid_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=True):
+def eval_embed_errors(env, pi, ob_traj, ac_traj, ob_rep, plot=True):
     # N is not number of agents, but total number of data points
     if ob_traj.size == 0:
-        return np.array([])
+        return [np.array([])] * 3
     dim = pi.dim
     N, window, _ = ob_traj.shape
     assert ac_traj.shape[0:2] == (N, window)
     assert ob_rep.shape[0] == N
-    n_uniq = len(np.unique(ob_rep[:,dim.ob]))
-    sysid_rep = pi.sysid_to_embedded(ob_rep[:,dim.ob:])
-    n_uniq_embed = len(np.unique(sysid_rep[:,0]))
-    #print("n_uniq:", n_uniq, ", n_uniq_embed:", n_uniq_embed)
-    assert n_uniq_embed == 1 or n_uniq == n_uniq_embed
-    sysid_estimated = pi.estimate_sysid(ob_traj, ac_traj)
-
-    std_all = np.std(sysid_estimated, axis=0)
-    std_within = np.sqrt(sysid_var_within_traj(sysid_estimated, sysid_rep))
-    #print("std_all: {}\nstd_within:{}".format(std_all, std_within))
-    #print("mean_true: {}, std_true: {}".format(
-        #np.mean(sysid_rep, axis=0), np.std(sysid_rep, axis=0)))
-    #print("mean_est: {}, std_est: {}".format(
-        #np.mean(sysid_estimated, axis=0), np.std(sysid_estimated, axis=0)))
-
-    if plot:
-        csvrows = np.concatenate([sysid_rep, sysid_estimated], axis=1)
-        np.savetxt('sysid_scatter.csv', csvrows)
-
-    assert sysid_estimated.shape == sysid_rep.shape
-    err2 = (sysid_rep - sysid_estimated) ** 2
-    err2 = np.mean(err2, axis=1)
-
+    sysid_rep = ob_rep[:,dim.ob:]
+    embed_rep = pi.sysid_to_embedded(sysid_rep)
+    embed_estimated = pi.estimate_sysid(ob_traj, ac_traj)
+    assert embed_estimated.shape == embed_rep.shape
+    err2 = np.mean((embed_rep - embed_estimated) ** 2, axis=1)
     assert err2.shape == (N,)
-    return err2
+    return err2, embed_rep, embed_estimated
 
-def traj_segment_generator(pi, env, horizon, stochastic, test=False):
+def traj_segment_generator(pi, env, horizon, stochastic, test=False, callback=None):
     dim = pi.dim
     t = 0
     N = env.N
@@ -154,7 +137,12 @@ def traj_segment_generator(pi, env, horizon, stochastic, test=False):
     ac = np.tile(ac, (N, 1))
     new = True # marks if we're on first timestep of an episode
     ob = env.reset()
+    #ob = env._get_obs()
     assert ob.shape[0] == N
+
+    # HACK TODO
+    if pi.flavor == "traj":
+        test = True
 
     cur_ep_rets = np.zeros(N) # return in current episode
     cur_ep_len = np.zeros(N) # len of current episode
@@ -172,19 +160,24 @@ def traj_segment_generator(pi, env, horizon, stochastic, test=False):
     assert acs.shape[1] == N
     prevacs = acs.copy()
 
-    if test:
-        ob_traj_input = np.zeros((N, dim.window, dim.ob))
-        ac_traj_input = np.zeros((N, dim.window, dim.ac))
+    # rolling window, starting with zeros
+    ob_traj_input = np.zeros((horizon, N, dim.window, dim.ob))
+    ac_traj_input = np.zeros((horizon, N, dim.window, dim.ac))
 
     k_episodes = 0
-    render_every = 10
+    render_every = 25
     while True:
+        if callback is not None:
+            callback(env, pi)
         if k_episodes % render_every == 0:
             pass
             #env.render()
+
         prevac = ac
+
+        i = t % horizon
         if test:
-            ac, vpred = pi.act_traj(stochastic, ob, ob_traj_input, ac_traj_input)
+            ac, vpred = pi.act_traj(stochastic, ob, ob_traj_input[i], ac_traj_input[i])
         else:
             ac, vpred = pi.act(stochastic, ob)
 
@@ -200,9 +193,10 @@ def traj_segment_generator(pi, env, horizon, stochastic, test=False):
             ob_trajs, ac_trajs, ob_reps, window_starts, window_scales = make_sysid_trajs(
                 pi.dim, obs, acs, news)
 
-            plot = k_episodes % 5 == 1
+            plot = k_episodes % 25 == 1
             #plot = True
-            err2s = eval_sysid_errors(env, pi, ob_trajs, ac_trajs, ob_reps, plot=plot)
+            err2s, embed_true, embed_estimate = eval_embed_errors(
+                env, pi, ob_trajs, ac_trajs, ob_reps, plot=plot)
             err2s = pi.alpha_sysid * err2s
             #if err2s.size > 0:
                 #print("err2s mean val:", np.mean(err2s.flatten()))
@@ -216,6 +210,8 @@ def traj_segment_generator(pi, env, horizon, stochastic, test=False):
                 "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                 "ep_rets" : ep_rets, "ep_lens" : ep_lens,
                 "ob_trajs" : ob_trajs, "ac_trajs" : ac_trajs, "ob_reps": ob_reps,
+                "ob_traj_input" : ob_traj_input, "ac_traj_input" : ac_traj_input,
+                "embed_true" : embed_true, "embed_estimate" : embed_estimate,
             }
 
             # Be careful!!! if you change the downstream algorithm to aggregate
@@ -226,9 +222,8 @@ def traj_segment_generator(pi, env, horizon, stochastic, test=False):
             embeds = pi.sysid_to_embedded(sysids)
             ep_rets = []
             ep_lens = []
-            if test:
-                ob_traj_input *= 0
-                ac_traj_input *= 0
+            ob_traj_input *= 0
+            ac_traj_input *= 0
 
         i = t % horizon
         obs[i,:,:] = ob
@@ -237,11 +232,12 @@ def traj_segment_generator(pi, env, horizon, stochastic, test=False):
         acs[i,:,:] = ac
         prevacs[i,:,:] = prevac
 
-        if test:
-            ob_traj_input = np.roll(ob_traj_input, -1, axis=1)
-            ac_traj_input = np.roll(ac_traj_input, -1, axis=1)
-            ob_traj_input[:,-1,:] = ob[:,:dim.ob]
-            ac_traj_input[:,-1,:] = ac
+        # ob_traj_input = np.zeros((horizon, N, dim.window, dim.ob))
+        if i < horizon - 1:
+            ob_traj_input[i+1] = np.roll(ob_traj_input[i], -1, axis=1)
+            ac_traj_input[i+1] = np.roll(ac_traj_input[i], -1, axis=1)
+            ob_traj_input[i+1,:,-1,:] = ob[:,:dim.ob]
+            ac_traj_input[i+1,:,-1,:] = ac
 
         ob, rew, new, _ = env.step(ac)
         rews[i,:] = rew
@@ -284,7 +280,7 @@ def add_vtarg_and_adv(N, seg, gamma, lam):
 
 
 def seg_flatten_batches(seg):
-    for s in ("ob", "ac", "adv", "tdlamret", "vpred"):
+    for s in ("ob", "ac", "ob_traj_input", "ac_traj_input", "adv", "tdlamret", "vpred"):
         sh = seg[s].shape
         newshape = [sh[0] * sh[1]] + list(sh[2:])
         seg[s] = np.reshape(seg[s], newshape)
