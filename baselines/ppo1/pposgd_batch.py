@@ -1,66 +1,26 @@
-from baselines.common import Dataset, explained_variance, fmt_row, zipsame, batch_util
+from baselines.common import Dataset, explained_variance, fmt_row, zipsame
+import baselines.common.batch_util2 as batch2
 from baselines import logger
 import baselines.common.tf_util as U
-import tensorflow as tf, numpy as np
-import time
-import datetime
-import csv
 from baselines.common.mpi_adam import MpiAdam
 from baselines.common.mpi_moments import mpi_moments
-from mpi4py import MPI
-from collections import deque
-from embed_explore import embed_explore
+
+import tensorflow as tf
+import numpy as np
 import matplotlib.pyplot as plt
+from mpi4py import MPI
+
+import time
+from collections import deque
+
 
 def flatten_lists(listoflists):
     return [el for list_ in listoflists for el in list_]
 
+def printstats(var, name):
+    print("{}: mean={:3f}, std={:3f}, min={:3f}, max={:3f}".format(
+        name, np.mean(var), np.std(var), np.min(var), np.max(var)))
 
-def vtarg_and_adv_1d(rew, new, vpred, nextvpred, gamma, lam):
-    new = np.append(new, 0) # last element is only used for last vtarg, but we already zeroed it if last new = 1
-    vpred = np.append(vpred, nextvpred)
-    T = len(rew)
-    adv = gaelam = np.empty(T, 'float32')
-    lastgaelam = 0
-    for t in reversed(range(T)):
-        nonterminal = 1-new[t+1]
-        delta = rew[t] + gamma * vpred[t+1] * nonterminal - vpred[t]
-        gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
-    tdlamret = adv + vpred[1:]
-    return tdlamret, adv
-
-def add_vtarg_and_adv_old(seg, gamma, lam):
-    """
-    Compute target value using TD(lambda) estimator, and advantage with GAE(lambda)
-    """
-    new = np.append(seg["new"], 0) # last element is only used for last vtarg, but we already zeroed it if last new = 1
-    vpred = np.append(seg["vpred"], seg["nextvpred"])
-    T = len(seg["rew"])
-    seg["adv"] = gaelam = np.empty(T, 'float32')
-    rew = seg["rew"]
-    lastgaelam = 0
-    for t in reversed(range(T)):
-        nonterminal = 1-new[t+1]
-        delta = rew[t] + gamma * vpred[t+1] * nonterminal - vpred[t]
-        gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
-    seg["tdlamret"] = seg["adv"] + seg["vpred"]
-
-def add_vtarg_and_adv(N, seg, gamma, lam):
-    new, vpred, nextvpred, rew = seg["new"], seg["vpred"], seg["nextvpred"], seg["rew"]
-    k = rew.shape[0]
-    tdlamret = np.empty((k,N))
-    gaelam = np.empty((k,N))
-    for i in range(N):
-        tdlamret[:,i], gaelam[:,i] = vtarg_and_adv_1d(
-            rew[:,i], new[:,i], vpred[:,i], nextvpred[i], gamma, lam)
-    seg["tdlamret"] = tdlamret
-    seg["adv"] = gaelam 
-
-def seg_flatten_batches(seg):
-    for s in ("ob", "ac", "adv", "tdlamret", "vpred"):
-        sh = seg[s].shape
-        newshape = [sh[0] * sh[1]] + list(sh[2:])
-        seg[s] = np.reshape(seg[s], newshape)
 
 def learn(env, policy_func, *,
         timesteps_per_actorbatch, # timesteps per actor per update
@@ -70,7 +30,8 @@ def learn(env, policy_func, *,
         max_timesteps=0, max_episodes=0, max_iters=0, max_seconds=0,  # time constraint
         callback=None, # you can do anything in the callback, since it takes locals(), globals()
         adam_epsilon=1e-5,
-        schedule='constant' # annealing for stepsize parameters (epsilon and adam)
+        schedule='constant', # annealing for stepsize parameters (epsilon and adam)
+        logdir
         ):
 
     N = env.N
@@ -112,14 +73,19 @@ def learn(env, policy_func, *,
     vf_loss = tf.reduce_mean(tf.square(pi.vpred - ret))
 
     # total loss for reinforcement learning
-    total_loss = pol_surr + pol_entpen + vf_loss
+    total_loss = pol_surr + pol_entpen
+    if len(pi.extra_rewards) > 0:
+        total_loss -= tf.reduce_mean(tf.add_n(pi.extra_rewards))
 
     # these losses are named so we can log them later
-    losses = [pol_surr, pol_entpen, vf_loss, meankl, meanent]
-    loss_names = ["pol_surr", "pol_entpen", "vf_loss", "kl", "ent"]
+    losses = [pol_surr, pol_entpen, vf_loss, meankl, meanent] + pi.extra_rewards
+    loss_names = ["pol_surr", "pol_entpen", "vf_loss", "kl", "ent"] + pi.extra_reward_names
     compute_losses = U.function([ob, ac, atarg, ret, lrmult], losses)
 
     var_list = pi.get_trainable_variables()
+    vf_var_list = [v for v in var_list if v.name.split("/")[1].startswith("vf")]
+    assert len(vf_var_list) > 0
+
 
     # gradient and Adam optimizer for policy
     lossandgrad = U.function(
@@ -129,12 +95,15 @@ def learn(env, policy_func, *,
 
     # gradient and Adam optimizer for SysID network
     # they are separate so we can use different learning rate schedules, etc.
-    traj_ob = U.get_placeholder_cached(name="traj_ob")
-    traj_ac = U.get_placeholder_cached(name="traj_ac")
+    traj_ob = U.get_placeholder_cached(name="ob_traj")
+    traj_ac = U.get_placeholder_cached(name="ac_traj")
     lossandgrad_sysid = U.function(
         [ob, traj_ob, traj_ac, lrmult],
         [pi.sysid_err_supervised, U.flatgrad(pi.sysid_err_supervised, var_list)])
     adam_sysid = MpiAdam(var_list, epsilon=adam_epsilon)
+
+    lossandgrad_vf = U.function([ob, ac, ret], [vf_loss, U.flatgrad(vf_loss, vf_var_list)])
+    adam_vf = MpiAdam(vf_var_list, epsilon=adam_epsilon)
 
     assign_old_eq_new = U.function([],[], updates=[tf.assign(oldv, newv)
         for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())])
@@ -144,26 +113,21 @@ def learn(env, policy_func, *,
     writer = tf.summary.FileWriter('./board', tf.get_default_session().graph)
     adam.sync()
     adam_sysid.sync()
-    seg_gen = batch_util.traj_segment_generator(pi, env, timesteps_per_actorbatch, stochastic=True)
+    adam_vf.sync()
+    seg_gen = batch2.sysid_simple_generator(pi, env, stochastic=True, test=False)
 
     episodes_so_far = 0
     timesteps_so_far = 0
     timesteps_since_last_episode_end = 0
     iters_so_far = 0
     tstart = time.time()
-    lenbuffer = deque(maxlen=100) # rolling buffer for episode lengths
-    rewbuffer = deque(maxlen=100) # rolling buffer for episode rewards
+    lenbuffer = deque(maxlen=1) # rolling buffer for episode lengths
+    rewbuffer = deque(maxlen=1) # rolling buffer for episode rewards
 
     assert sum([max_iters > 0, max_timesteps > 0, max_episodes > 0, max_seconds > 0]) == 1, \
         "Only one time constraint permitted"
 
-    csvpath = './ppobatch_log_' + str(datetime.datetime.now()) + '.csv'
-    csvfile = open(csvpath, 'w', newline='')
-    csvwriter = csv.writer(csvfile)
-    def logrow(row):
-        csvwriter.writerow(row)
-        csvfile.flush()
-    logrow(['reward', 'episode_len', 'n_episodes'] + loss_names)
+    logger.configure(dir=logdir, format_strs=['stdout', 'csv'])
 
     while True:
         if callback: callback(locals(), globals())
@@ -190,12 +154,14 @@ def learn(env, policy_func, *,
         logger.log("********** Iteration %i ************"%iters_so_far)
 
         seg = seg_gen.__next__()
-        add_vtarg_and_adv(N, seg, gamma, lam)
+        batch2.add_vtarg_and_adv(seg, gamma, lam)
         # flatten leading (agent, rollout) dims to one big batch
         # (note: must happen AFTER add_vtarg_and_adv)
-        seg_flatten_batches(seg)
+        batch2.seg_flatten_batches(seg)
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
-        ob_traj_batch, ac_traj_batch, ob_rep_batch = seg["ob_trajs"], seg["ac_trajs"], seg["ob_reps"]
+        ob_traj, ac_traj = seg["ob_traj"], seg["ac_traj"]
+        #print_stats(atarg, "atarg")
+        #print_stats(tdlamret, "tdlamret")
 
         #for k, v in seg.items():
             #try:
@@ -210,7 +176,11 @@ def learn(env, policy_func, *,
         assign_old_eq_new() # set old parameter values to new parameter values
 
         # Dataset object handles minibatching for SGD
-        d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
+        d = Dataset(
+            dict(
+                ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret,
+                ob_traj=ob_traj, ac_traj=ac_traj,
+            ), shuffle=not pi.recurrent)
         optim_batchsize = min((optim_batchsize or 2048), ob.shape[0])
 
         print("optim_batchsize:", optim_batchsize)
@@ -223,25 +193,30 @@ def learn(env, policy_func, *,
             losses = [] # list of tuples, each of which gives the loss for a minibatch
             sysid_losses = []
             for batch in d.iterate_once(optim_batchsize):
-                *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
+                *newlosses, g = lossandgrad(
+                    batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
                 adam.update(g, optim_stepsize * cur_lrmult) 
                 losses.append(newlosses)
 
-                if ob_rep_batch.size > 0:
-                    # seems that we need a lower learning rate here - 
-                    # perhaps bc the sysid gradient is a less noisy estimate
-                    # than the RL policy gradient, so there's less cancellation
-                    # due to momentum in Adam
-                    *newlosses_sysid, g_sysid = lossandgrad_sysid(
-                        ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
-                    adam_sysid.update(g_sysid, 0.3*optim_stepsize * cur_lrmult)
-                    sysid_losses.append(newlosses_sysid[0])
+                # seems that we need a lower learning rate here - 
+                # perhaps bc the sysid gradient is a less noisy estimate
+                # than the RL policy gradient, so there's less cancellation
+                # due to momentum in Adam
+                *newlosses_sysid, g_sysid = lossandgrad_sysid(
+                    batch["ob"], batch["ob_traj"], batch["ac_traj"], cur_lrmult)
+                adam_sysid.update(g_sysid, optim_stepsize * cur_lrmult)
+
+                sysid_losses.append(newlosses_sysid[0])
+
+                vf_losses, g_vf = lossandgrad_vf(batch["ob"], batch["ac"], batch["vtarg"])
+                adam_vf.update(g_vf, 3.0 * optim_stepsize * cur_lrmult)
 
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
         logger.log("Evaluating losses...")
         # compute and log the final losses after this round of optimization.
-        # TODO figure out why we do this complicated thing instead of passing in the whole dataset - 
+        # TODO figure out why we do this complicated thing
+        # instead of passing in the whole dataset - 
         # maybe it's to avoid filling up GPU memory?
         losses = []
         sysid_losses = []
@@ -249,26 +224,23 @@ def learn(env, policy_func, *,
             newlosses = compute_losses(
                 batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
             losses.append(newlosses)
-            if ob_rep_batch.size > 0:
-                sysid_newlosses, _ = lossandgrad_sysid(
-                    ob_rep_batch, ob_traj_batch, ac_traj_batch, cur_lrmult)
-                sysid_losses.append(sysid_newlosses)
+            sysid_newlosses, _ = lossandgrad_sysid(
+                batch["ob"], batch["ob_traj"], batch["ac_traj"], cur_lrmult)
+            sysid_losses.append(sysid_newlosses)
         meanlosses,_,_ = mpi_moments(losses, axis=0)
         logger.log(fmt_row(13, meanlosses))
 
         for (lossval, name) in zipsame(meanlosses, loss_names):
             logger.record_tabular("loss_"+name, lossval)
 
-        meanlosses_sysid = [-1]
-        if len(sysid_losses) > 0:
-            meanlosses_sysid, _, _ = mpi_moments(sysid_losses, axis=0)
+        meanlosses_sysid, _, _ = mpi_moments(sysid_losses, axis=0)
         meanlosses_sysid = np.atleast_1d(meanlosses_sysid)
         assert len(meanlosses_sysid) == 1
         logger.record_tabular("SysID loss", meanlosses_sysid[0])
 
         # log some further information about this iteration
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
-        lrlocal = (seg["ep_lens"], seg["ep_rets"]) # local values
+        lrlocal = (seg["ep_lens"], seg["ep_rews"]) # local values
         listoflrpairs = MPI.COMM_WORLD.allgather(lrlocal) # list of tuples
         lens, rews = map(flatten_lists, zip(*listoflrpairs))
         lenbuffer.extend(lens)
@@ -284,16 +256,3 @@ def learn(env, policy_func, *,
         logger.record_tabular("TimeElapsed", time.time() - tstart)
         if MPI.COMM_WORLD.Get_rank()==0:
             logger.dump_tabular()
-
-        meanlen = np.mean(lenbuffer)
-        meanrew = np.mean(rewbuffer)
-        logrow([meanrew, meanlen, len(lens)] + list(meanlosses))
-
-        # check our simple criteria for "solving" the environment
-        if len(lens) == 0:
-            timesteps_since_last_episode_end += N * timesteps_per_actorbatch
-            #if timesteps_since_last_episode_end > 400000:
-                #print("timesteps since last episode ended > 400000 - env learned")
-                #break
-        else:
-            timesteps_since_last_episode_end = 0
