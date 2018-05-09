@@ -59,7 +59,7 @@ def learn(env, policy_fn, *,
     sysid_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("sysid")]
 
     optimgain = surrgain + entbonus - (
-        0.002 * tf.reduce_mean([tf.nn.l2_loss(v) for v in var_list]))
+        0.000 * tf.reduce_mean([tf.nn.l2_loss(v) for v in var_list]))
     if pi.extra_rewards:
         optimgain += tf.add_n(pi.extra_rewards)
     losses = [optimgain, meankl, entbonus, surrgain, meanent] + pi.extra_rewards
@@ -105,7 +105,7 @@ def learn(env, policy_fn, *,
     compute_lossandgrad = U.function([ob, ac, atarg], losses + 
         [tf.clip_by_value(U.flatgrad(optimgain, var_list), -0.1, 0.1)])
     compute_fvp = U.function([flat_tangent, ob, ac, atarg], fvp)
-    compute_vflossandgrad = U.function([ob, ret], U.flatgrad(vferr, vf_var_list))
+    compute_vflossandgrad = U.function([ob, ret], [vferr, U.flatgrad(vferr, vf_var_list)])
 
     # gradient and Adam optimizer for SysID network
     # they are separate so we can use different learning rate schedules, etc.
@@ -252,7 +252,9 @@ def learn(env, policy_fn, *,
             for _ in range(vf_iters):
                 for (mbob, mbret) in dataset.iterbatches((seg["ob"], seg["tdlamret"]),
                 include_final_partial_batch=False, batch_size=256):
-                    g = allmean(compute_vflossandgrad(mbob, mbret))
+                    loss, g = compute_vflossandgrad(mbob, mbret)
+                    logger.record_tabular("vf_loss", np.mean(loss))
+                    g = allmean(g)
                     vfadam.update(g, vf_stepsize)
 
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
