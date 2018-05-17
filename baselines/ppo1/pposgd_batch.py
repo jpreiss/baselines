@@ -209,7 +209,7 @@ def learn(env, policy_func, *,
                 sysid_losses.append(newlosses_sysid[0])
 
                 vf_losses, g_vf = lossandgrad_vf(batch["ob"], batch["ac"], batch["vtarg"])
-                adam_vf.update(g_vf, 3.0 * optim_stepsize * cur_lrmult)
+                adam_vf.update(g_vf, optim_stepsize * cur_lrmult)
 
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
