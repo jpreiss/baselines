@@ -85,7 +85,12 @@ def learn(env, policy_func, *,
     var_list = pi.get_trainable_variables()
     vf_var_list = [v for v in var_list if v.name.split("/")[1].startswith("vf")]
     assert len(vf_var_list) > 0
+    sysid_var_list = [v for v in var_list if v.name.split("/")[1].startswith("sysid")]
 
+    def n_params(vars):
+        return np.sum([np.prod(v.shape) for v in vars])
+    for list, name in ((var_list, "pol"), (vf_var_list, "vf"), (sysid_var_list, "sysid")):
+        print("{}: {} params".format(name, n_params(list)))
 
     # gradient and Adam optimizer for policy
     lossandgrad = U.function(
