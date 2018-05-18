@@ -1,4 +1,5 @@
-from baselines.common import explained_variance, zipsame, dataset, batch_util
+from baselines.common import explained_variance, zipsame, dataset
+import baselines.common.batch_util2 as batch2
 from baselines import logger
 import baselines.common.tf_util as U
 import tensorflow as tf, numpy as np
@@ -140,7 +141,7 @@ def learn(env, policy_fn, *,
 
     # Prepare for rollouts
     # ----------------------------------------
-    seg_gen = batch_util.traj_segment_generator(pi, env, timesteps_per_batch, stochastic=True)
+    seg_gen = batch2.sysid_simple_generator(pi, env, stochastic=True, test=False)
 
     episodes_so_far = 0
     timesteps_so_far = 0
@@ -167,13 +168,13 @@ def learn(env, policy_fn, *,
 
         with timed("sampling"):
             seg = seg_gen.__next__()
-        batch_util.add_vtarg_and_adv(N, seg, gamma, lam)
-        batch_util.seg_flatten_batches(seg)
+        batch2.add_vtarg_and_adv(seg, gamma, lam)
+        batch2.seg_flatten_batches(seg)
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
         printstats(ac, "actions")
-        ob_traj_batch, ac_traj_batch, ob_rep_batch = seg["ob_trajs"], seg["ac_trajs"], seg["ob_reps"]
+        ob_traj_batch, ac_traj_batch = seg["ob_traj"], seg["ac_traj"]
         vpredbefore = seg["vpred"] # predicted value function before udpate
         printstats(atarg, "atarg")
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
@@ -241,11 +242,11 @@ def learn(env, policy_fn, *,
             with timed("sysid"):
                 for _ in range(4*vf_iters):
                     *newlosses_sysid, g_sysid = lossandgrad_sysid(
-                        ob_rep_batch, ob_traj_batch, ac_traj_batch)
+                        ob, ob_traj_batch, ac_traj_batch)
                     adam_sysid.update(g_sysid, vf_stepsize)
     #                sysid_loss_iters.append(newlosses_sysid[0])
             loss_sysid, _ = lossandgrad_sysid(
-                        ob_rep_batch, ob_traj_batch, ac_traj_batch)
+                        ob, ob_traj_batch, ac_traj_batch)
             logger.record_tabular("loss_sysid", loss_sysid)
 
         with timed("vf"):
@@ -259,7 +260,7 @@ def learn(env, policy_fn, *,
 
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
 
-        lrlocal = (seg["ep_lens"], seg["ep_rets"]) # local values
+        lrlocal = (seg["ep_lens"], seg["ep_rews"]) # local values
         listoflrpairs = MPI.COMM_WORLD.allgather(lrlocal) # list of tuples
         lens, rews = map(flatten_lists, zip(*listoflrpairs))
         lenbuffer.extend(lens)
