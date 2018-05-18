@@ -2,6 +2,11 @@ import itertools
 import numpy as np
 
 RENDER = False
+RENDER_EVERY = 10
+
+def printstats(var, name):
+    print("{}: mean={:3f}, std={:3f}, min={:3f}, max={:3f}".format(
+        name, np.mean(var), np.std(var), np.min(var), np.max(var)))
 
 # for fixed length episodes
 # expects env to have ep_len member variable
@@ -22,13 +27,17 @@ def sysid_simple_generator(pi, env, stochastic, test=False):
 
     for episode in itertools.count():
 
+        # TODO could make it possible to include more than one reset in a batch
+        # without also resampling SysIDs. But is it actually useful?
+        env.sample_sysid()
         ob = env.reset()
         assert ob.shape == (N, dim.ob_concat)
+        ob_trajs *= 0
+        ac_trajs *= 0
 
         for step in range(horizon):
 
-            render_every = 25
-            if RENDER and episode % render_every == 0:
+            if RENDER and episode % RENDER_EVERY == 0:
                 env.render()
 
             obs[step,:,:] = ob
@@ -70,7 +79,12 @@ def sysid_simple_generator(pi, env, stochastic, test=False):
         for i in range(horizon):
             begin = max(i - dim.window, 0)
             sysid_rews[begin:i,:] += err2s[i,:]
-        rews += pi.alpha_sysid * sysid_rews
+        sysid_rews *= pi.alpha_sysid
+
+        printstats(rews.flat, "main rews")
+        printstats(sysid_rews[:-1].flat, "SysID rews")
+
+        rews -= sysid_rews
         # TODO keep these separate and let the RL algorithm reason about it?
 
 
@@ -81,11 +95,6 @@ def sysid_simple_generator(pi, env, stochastic, test=False):
             "embed_true" : embed_trues, "embed_estimate" : embed_estimates,
             "ep_rews" : ep_rews, "ep_lens" : horizon + 0 * ep_rews,
         }
-
-        # TODO could make it possible to include more than one reset in a batch
-        # without also resampling SysIDs. But is it actually useful?
-        env.sample_sysid()
-        env.reset()
 
 
 def add_vtarg_and_adv(seg, gamma, lam):
@@ -104,7 +113,6 @@ def add_vtarg_and_adv(seg, gamma, lam):
     gaelam = gaelam[:-1]
     seg["adv"] = gaelam
     seg["tdlamret"] = gaelam + vpred
-    # TODO: need to trim off T+1 row?
 
 
 # flattens arrays that are (horizon, N, ...) shape into (horizon * N, ...)
