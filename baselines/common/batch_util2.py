@@ -1,7 +1,7 @@
 import itertools
+import os
 import numpy as np
 
-RENDER = False
 RENDER_EVERY = 10
 
 def printstats(var, name):
@@ -10,7 +10,7 @@ def printstats(var, name):
 
 # for fixed length episodes
 # expects env to have ep_len member variable
-def sysid_simple_generator(pi, env, stochastic, test=False):
+def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None):
 
     N = env.N
     dim = pi.dim
@@ -35,9 +35,13 @@ def sysid_simple_generator(pi, env, stochastic, test=False):
         ob_trajs *= 0
         ac_trajs *= 0
 
+        # touch / rm this file to toggle rendering
+        render = (force_render if force_render is not None
+            else os.path.exists("render"))
+
         for step in range(horizon):
 
-            if RENDER and episode % RENDER_EVERY == 0:
+            if render and episode % RENDER_EVERY == 0:
                 env.render()
 
             obs[step,:,:] = ob
