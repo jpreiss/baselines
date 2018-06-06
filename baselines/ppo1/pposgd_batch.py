@@ -22,8 +22,7 @@ def printstats(var, name):
         name, np.mean(var), np.std(var), np.min(var), np.max(var)))
 
 
-def learn(env, policy_func, *,
-        timesteps_per_actorbatch, # timesteps per actor per update
+def learn(np_random, env, policy_func, *,
         clip_param, entcoeff, # clipping parameter epsilon, entropy coeff
         optim_epochs, optim_stepsize, optim_batchsize,# optimization hypers
         gamma, lam, # advantage estimation
@@ -152,7 +151,7 @@ def learn(env, policy_func, *,
         if schedule == 'constant':
             cur_lrmult = 1.0
         elif schedule == 'linear':
-            cur_lrmult =  max(1.0 - float(timesteps_so_far) / max_timesteps, 0)
+            cur_lrmult =  max(1.0 - float(iters_so_far) / max_iters, 0.05)
         else:
             raise NotImplementedError
 
@@ -181,7 +180,7 @@ def learn(env, policy_func, *,
         assign_old_eq_new() # set old parameter values to new parameter values
 
         # Dataset object handles minibatching for SGD
-        d = Dataset(
+        d = Dataset(np_random,
             dict(
                 ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret,
                 ob_traj=ob_traj, ac_traj=ac_traj,

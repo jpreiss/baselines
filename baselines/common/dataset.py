@@ -1,7 +1,8 @@
 import numpy as np
 
 class Dataset(object):
-    def __init__(self, data_map, deterministic=False, shuffle=True):
+    def __init__(self, np_random, data_map, deterministic=False, shuffle=True):
+        self.np_random = np_random
         self.data_map = data_map
         self.deterministic = deterministic
         self.enable_shuffle = shuffle
@@ -15,7 +16,7 @@ class Dataset(object):
         if self.deterministic:
             return
         perm = np.arange(self.n)
-        np.random.shuffle(perm)
+        self.np_random.shuffle(perm)
 
         for key in self.data_map:
             self.data_map[key] = self.data_map[key][perm]
