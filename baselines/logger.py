@@ -39,6 +39,8 @@ class HumanOutputFormat(KVWriter, SeqWriter):
         # Create strings for printing
         key2str = {}
         for (key, val) in sorted(kvs.items()):
+            if key.startswith("Env") and key.endswith("Rew"):
+                continue
             if isinstance(val, float):
                 valstr = '%-8.3g' % (val,)
             else:

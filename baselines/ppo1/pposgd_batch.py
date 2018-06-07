@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 from mpi4py import MPI
 
 import time
-from collections import deque
 
 
 def flatten_lists(listoflists):
@@ -125,8 +124,6 @@ def learn(np_random, env, policy_func, *,
     timesteps_since_last_episode_end = 0
     iters_so_far = 0
     tstart = time.time()
-    lenbuffer = deque(maxlen=1) # rolling buffer for episode lengths
-    rewbuffer = deque(maxlen=1) # rolling buffer for episode rewards
 
     assert sum([max_iters > 0, max_timesteps > 0, max_episodes > 0, max_seconds > 0]) == 1, \
         "Only one time constraint permitted"
@@ -164,14 +161,6 @@ def learn(np_random, env, policy_func, *,
         batch2.seg_flatten_batches(seg)
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
         ob_traj, ac_traj = seg["ob_traj"], seg["ac_traj"]
-        #print_stats(atarg, "atarg")
-        #print_stats(tdlamret, "tdlamret")
-
-        #for k, v in seg.items():
-            #try:
-                #print(k, ":", v.shape)
-            #except AttributeError:
-                #print(k, ": not a np.array")
 
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
@@ -187,7 +176,6 @@ def learn(np_random, env, policy_func, *,
             ), shuffle=not pi.recurrent)
         optim_batchsize = min((optim_batchsize or 2048), ob.shape[0])
 
-        print("optim_batchsize:", optim_batchsize)
         logger.log("Optimizing...")
         #np.seterr(all='raise')
         logger.log(fmt_row(13, loss_names))
@@ -202,10 +190,6 @@ def learn(np_random, env, policy_func, *,
                 adam.update(g, optim_stepsize * cur_lrmult) 
                 losses.append(newlosses)
 
-                # seems that we need a lower learning rate here - 
-                # perhaps bc the sysid gradient is a less noisy estimate
-                # than the RL policy gradient, so there's less cancellation
-                # due to momentum in Adam
                 *newlosses_sysid, g_sysid = lossandgrad_sysid(
                     batch["ob"], batch["ob_traj"], batch["ac_traj"], cur_lrmult)
                 adam_sysid.update(g_sysid, optim_stepsize * cur_lrmult)
@@ -247,16 +231,17 @@ def learn(np_random, env, policy_func, *,
         lrlocal = (seg["ep_lens"], seg["ep_rews"]) # local values
         listoflrpairs = MPI.COMM_WORLD.allgather(lrlocal) # list of tuples
         lens, rews = map(flatten_lists, zip(*listoflrpairs))
-        lenbuffer.extend(lens)
-        rewbuffer.extend(rews)
         episodes_so_far += len(lens)
         timesteps_so_far += sum(lens)
         iters_so_far += 1
-        logger.record_tabular("EpLenMean", np.mean(lenbuffer))
-        logger.record_tabular("EpRewMean", np.mean(rewbuffer))
+        logger.record_tabular("EpLenMean", np.mean(lens))
+        logger.record_tabular("EpRewMean", np.mean(rews))
         logger.record_tabular("EpThisIter", len(lens))
         logger.record_tabular("EpisodesSoFar", episodes_so_far)
         logger.record_tabular("TimestepsSoFar", timesteps_so_far)
         logger.record_tabular("TimeElapsed", time.time() - tstart)
+        assert len(rews) == N
+        for i in range(N):
+            logger.record_tabular("Env{}Rew".format(i), rews[i])
         if MPI.COMM_WORLD.Get_rank()==0:
             logger.dump_tabular()
