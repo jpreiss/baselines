@@ -77,24 +77,23 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None):
             ob_trajs.reshape((horizon * N, dim.window, dim.ob)),
             ac_trajs.reshape((horizon * N, dim.window, dim.ac)))
         embed_estimates = embed_estimates.reshape((horizon, N, -1))
-        err2s = np.mean((embed_trues - embed_estimates) ** 2, axis=-1)
+        err2s = (embed_trues - embed_estimates) ** 2
+        assert len(err2s.shape) == 3
+        meanerr2s = np.mean(err2s, axis=-1)
         # apply the err2 for each window to *all* actions in that window
-        sysid_rews = 0 * rews
+        sysid_loss = 0 * rews
         for i in range(horizon):
             begin = max(i - dim.window, 0)
-            sysid_rews[begin:i,:] += err2s[i,:]
-        sysid_rews *= pi.alpha_sysid
+            sysid_loss[begin:i,:] += meanerr2s[i,:]
+        sysid_loss *= (pi.alpha_sysid / dim.window)
 
-        printstats(rews.flat, "main rews")
-        printstats(sysid_rews[:-1].flat, "SysID rews")
-
-        rews -= sysid_rews
+        total_rews = rews - sysid_loss
         # TODO keep these separate and let the RL algorithm reason about it?
-
 
         # yield the batch to the RL algorithm
         yield {
-            "ob" : obs, "rew" : rews, "vpred" : vpreds, "ac" : acs, 
+            "ob" : obs, "vpred" : vpreds, "ac" : acs,
+            "rew" : total_rews, "task_rews" : rews, "sysid_loss" : sysid_loss,
             "ob_traj" : ob_trajs, "ac_traj" : ac_trajs,
             "embed_true" : embed_trues, "embed_estimate" : embed_estimates,
             "ep_rews" : ep_rews, "ep_lens" : horizon + 0 * ep_rews,
