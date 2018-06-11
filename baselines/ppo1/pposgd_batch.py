@@ -59,25 +59,26 @@ def learn(np_random, env, policy_func, *,
     # policy entropy & regularization
     ent = pi.pd.entropy()
     meanent = tf.reduce_mean(ent)
-    pol_entpen = (-entcoeff) * meanent
+    ent_rew = entcoeff * meanent
 
     # construct PPO's pessimistic surrogate loss (L^CLIP)
     ratio = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac))
     surr1 = ratio * atarg
     surr2 = tf.clip_by_value(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
-    pol_surr = - tf.reduce_mean(tf.minimum(surr1, surr2))
+    pol_surr = tf.reduce_mean(tf.minimum(surr1, surr2))
 
     # value function loss
     vf_loss = tf.reduce_mean(tf.square(pi.vpred - ret))
 
     # total loss for reinforcement learning
-    total_loss = pol_surr + pol_entpen
+    total_rew = pol_surr + ent_rew
     if len(pi.extra_rewards) > 0:
-        total_loss -= tf.reduce_mean(tf.add_n(pi.extra_rewards))
+        total_rew += tf.add_n(pi.extra_rewards)
+    total_loss = -total_rew
 
     # these losses are named so we can log them later
-    losses = [pol_surr, pol_entpen, vf_loss, meankl, meanent] + pi.extra_rewards
-    loss_names = ["pol_surr", "pol_entpen", "vf_loss", "kl", "ent"] + pi.extra_reward_names
+    losses = [pol_surr, ent_rew, vf_loss, meankl, meanent] + pi.extra_rewards
+    loss_names = ["pol_surr", "ent_rew", "vf_loss", "kl", "ent"] + pi.extra_reward_names
     compute_losses = U.function([ob, ac, atarg, ret, lrmult], losses)
 
     var_list = pi.get_trainable_variables()
@@ -158,6 +159,7 @@ def learn(np_random, env, policy_func, *,
         batch2.add_vtarg_and_adv(seg, gamma, lam)
         # flatten leading (agent, rollout) dims to one big batch
         # (note: must happen AFTER add_vtarg_and_adv)
+        sysid_vals = seg["ob"][0,:,dim.ob:]
         batch2.seg_flatten_batches(seg)
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
         ob_traj, ac_traj = seg["ob_traj"], seg["ac_traj"]
@@ -176,27 +178,41 @@ def learn(np_random, env, policy_func, *,
             ), shuffle=not pi.recurrent)
         optim_batchsize = min((optim_batchsize or 2048), ob.shape[0])
 
-        logger.log("Optimizing...")
         #np.seterr(all='raise')
-        logger.log(fmt_row(13, loss_names))
+        logger.log(fmt_row(13, loss_names + ["SysID"]))
 
+        logger.log("Evaluating losses before...")
+        # compute and log the final losses after this round of optimization.
+        # TODO figure out why we do this complicated thing
+        # instead of passing in the whole dataset - 
+        # maybe it's to avoid filling up GPU memory?
+        losses = []
+        for batch in d.iterate_once(optim_batchsize):
+            newlosses = compute_losses(
+                batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
+            sysid_loss, _ = lossandgrad_sysid(
+                batch["ob"], batch["ob_traj"], batch["ac_traj"], cur_lrmult)
+            losses.append(newlosses + [sysid_loss])
+
+        meanlosses,_,_ = mpi_moments(losses, axis=0)
+        logger.log(fmt_row(13, meanlosses))
+
+        logger.log("Optimizing...")
         # Here we do a bunch of optimization epochs over the data
         for _ in range(optim_epochs):
             losses = [] # list of tuples, each of which gives the loss for a minibatch
-            sysid_losses = []
             for batch in d.iterate_once(optim_batchsize):
                 *newlosses, g = lossandgrad(
                     batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
                 adam.update(g, optim_stepsize * cur_lrmult) 
-                losses.append(newlosses)
 
-                *newlosses_sysid, g_sysid = lossandgrad_sysid(
-                    batch["ob"], batch["ob_traj"], batch["ac_traj"], cur_lrmult)
-                adam_sysid.update(g_sysid, optim_stepsize * cur_lrmult)
+                loss_sysid, g_sysid = lossandgrad_sysid(
+                    batch["ob"], batch["ob_traj"], batch["ac_traj"], 0.1*cur_lrmult)
+                adam_sysid.update(g_sysid, optim_stepsize * 0.2*cur_lrmult)
 
-                sysid_losses.append(newlosses_sysid[0])
+                losses.append(newlosses + [loss_sysid])
 
-                vf_losses, g_vf = lossandgrad_vf(batch["ob"], batch["ac"], batch["vtarg"])
+                _, g_vf = lossandgrad_vf(batch["ob"], batch["ac"], batch["vtarg"])
                 adam_vf.update(g_vf, optim_stepsize * cur_lrmult)
 
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
@@ -207,24 +223,24 @@ def learn(np_random, env, policy_func, *,
         # instead of passing in the whole dataset - 
         # maybe it's to avoid filling up GPU memory?
         losses = []
-        sysid_losses = []
         for batch in d.iterate_once(optim_batchsize):
             newlosses = compute_losses(
                 batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
-            losses.append(newlosses)
-            sysid_newlosses, _ = lossandgrad_sysid(
+            sysid_loss, _ = lossandgrad_sysid(
                 batch["ob"], batch["ob_traj"], batch["ac_traj"], cur_lrmult)
-            sysid_losses.append(sysid_newlosses)
+            losses.append(newlosses + [sysid_loss])
+
         meanlosses,_,_ = mpi_moments(losses, axis=0)
         logger.log(fmt_row(13, meanlosses))
 
-        for (lossval, name) in zipsame(meanlosses, loss_names):
+
+        for (lossval, name) in zipsame(meanlosses, loss_names + ["SysID"]):
             logger.record_tabular("loss_"+name, lossval)
 
-        meanlosses_sysid, _, _ = mpi_moments(sysid_losses, axis=0)
-        meanlosses_sysid = np.atleast_1d(meanlosses_sysid)
-        assert len(meanlosses_sysid) == 1
-        logger.record_tabular("SysID loss", meanlosses_sysid[0])
+        embeddings_before_update = seg["embed_true"]
+        embeddings_after_update = pi.sysid_to_embedded(sysid_vals)
+        emb_delta = embeddings_after_update - embeddings_before_update
+        printstats(abs(emb_delta), "abs(embeddings change after gradient step)")
 
         # log some further information about this iteration
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
@@ -236,6 +252,7 @@ def learn(np_random, env, policy_func, *,
         iters_so_far += 1
         logger.record_tabular("EpLenMean", np.mean(lens))
         logger.record_tabular("EpRewMean", np.mean(rews))
+        logger.record_tabular("EpRewWorst", np.amin(rews))
         logger.record_tabular("EpThisIter", len(lens))
         logger.record_tabular("EpisodesSoFar", episodes_so_far)
         logger.record_tabular("TimestepsSoFar", timesteps_so_far)
