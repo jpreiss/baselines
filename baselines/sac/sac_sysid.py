@@ -80,47 +80,52 @@ def learn(np_random, env, policy_func, *,
 
     N = env.N
 
+
     # TODO param
     #lr = 1e-3
     lr = 3e-4
     scale_reward = 5.0
     tau = 0.005
     init_explore_steps = 1e4
-    n_train_repeat = int(np.log2(2*N)) # made-up heuristic
+    n_train_repeat = 2#int(np.log2(2*N)) # made-up heuristic
     buf_len = int(1e6)
-    mlp_size = (128, 128)
+    mlp_size = (100, 100, 100)
 
 
     # placeholders
     obs_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "ob")
-    nextob_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "next_ob")
     ac_ph = tf.placeholder(tf.float32, (None, dim.ac), "ac")
     rew_ph = tf.placeholder(tf.float32, (None, ), "rew")
+    nextob_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "next_ob")
 
     # value function
     vf = batch2.MLP("myvf", obs_ph, mlp_size, 1, tf.nn.relu)
 
     # policy
-    reg = tf.contrib.layers.l2_regularizer(1e-3)
-    policy = batch2.SquashedGaussianPolicy("sgpolicy",
-        obs_ph, mlp_size, dim.ac, tf.nn.relu, reg=reg)
-    log_pi = policy.logp(policy.raw_ac)
+    with tf.variable_scope("policy"):
+        reg = tf.contrib.layers.l2_regularizer(1e-3)
+        policy = batch2.SquashedGaussianPolicy("sgpolicy",
+            obs_ph, mlp_size, dim.ac, tf.nn.relu, reg=reg)
+        with tf.variable_scope("log_prob"):
+            log_pi = policy.logp(policy.raw_ac)
 
     # double q functions - these ones are used "on-policy" in the vf loss
-    q_in = tf.concat([obs_ph, policy.ac], axis=1)
+    q_in = tf.concat([obs_ph, policy.ac], axis=1, name="q_in")
     qf1 = batch2.MLP("qf1", q_in, mlp_size, 1, tf.nn.relu)
     qf2 = batch2.MLP("qf2", q_in, mlp_size, 1, tf.nn.relu)
-    qf_min = tf.minimum(qf1.out, qf2.out)
+    qf_min = tf.minimum(qf1.out, qf2.out, name="qf_min")
 
     # policy loss
-    policy_kl_loss = tf.reduce_mean(log_pi - qf_min)
-    pi_reg_losses = tf.get_collection(
-        tf.GraphKeys.REGULARIZATION_LOSSES, scope=policy.name)
-    pi_reg_losses += [policy.reg_loss]
-    policy_loss = policy_kl_loss + tf.reduce_sum(pi_reg_losses)
+    with tf.variable_scope("policy_loss"):
+        policy_kl_loss = tf.reduce_mean(log_pi - qf_min)
+        pi_reg_losses = tf.get_collection(
+            tf.GraphKeys.REGULARIZATION_LOSSES, scope=policy.name)
+        pi_reg_losses += [policy.reg_loss]
+        policy_loss = policy_kl_loss + tf.reduce_sum(pi_reg_losses)
 
     # value function loss
-    vf_loss = 0.5 * tf.reduce_mean((vf.out - tf.stop_gradient(qf_min - log_pi))**2)
+    with tf.variable_scope("vf_loss"):
+        vf_loss = 0.5 * tf.reduce_mean((vf.out - tf.stop_gradient(qf_min - log_pi))**2)
 
     # same q functions, but for the off-policy TD training
     qtrain_in = tf.concat([obs_ph, ac_ph], axis=1)
@@ -128,35 +133,41 @@ def learn(np_random, env, policy_func, *,
     qf2_t = batch2.MLP("qf2", qtrain_in, mlp_size, 1, tf.nn.relu, reuse=True)
 
     # target (slow-moving) vf, used to update Q functions
-    with tf.variable_scope('target'):
-        vf_TDtarget = batch2.MLP("vf_target", nextob_ph, mlp_size, 1, tf.nn.relu)
+    vf_TDtarget = batch2.MLP("vf_target", nextob_ph, mlp_size, 1, tf.nn.relu)
 
     # q fn TD-target & losses
-    ys = tf.stop_gradient(scale_reward * rew_ph + gamma * vf_TDtarget.out)
-    TD_loss1 = 0.5 * tf.reduce_mean((ys - qf1_t.out)**2)
-    TD_loss2 = 0.5 * tf.reduce_mean((ys - qf2_t.out)**2)
+    with tf.variable_scope("TD_target"):
+        TD_target = tf.stop_gradient(
+            scale_reward * rew_ph + gamma * vf_TDtarget.out)
+
+    with tf.variable_scope("TD_loss1"):
+        TD_loss1 = 0.5 * tf.reduce_mean((TD_target - qf1_t.out)**2)
+
+    with tf.variable_scope("TD_loss2"):
+        TD_loss2 = 0.5 * tf.reduce_mean((TD_target - qf2_t.out)**2)
 
 
     # training ops
-    policy_opt_op = tf.train.AdamOptimizer(lr).minimize(
+    policy_opt_op = tf.train.AdamOptimizer(lr, name="policy_adam").minimize(
         policy_loss, var_list=policy.get_params_internal())
 
-    vf_opt_op = tf.train.AdamOptimizer(lr).minimize(
+    vf_opt_op = tf.train.AdamOptimizer(lr, name="vf_adam").minimize(
         vf_loss, var_list=vf.vars)
 
-    qf1_opt_op = tf.train.AdamOptimizer(lr).minimize(
+    qf1_opt_op = tf.train.AdamOptimizer(lr, name="qf1_adam").minimize(
         TD_loss1, var_list=qf1.vars)
 
-    qf2_opt_op = tf.train.AdamOptimizer(lr).minimize(
+    qf2_opt_op = tf.train.AdamOptimizer(lr, name="qf2_adam").minimize(
         TD_loss2, var_list=qf2.vars)
 
     train_ops = [policy_opt_op, vf_opt_op, qf1_opt_op, qf2_opt_op]
 
     # ops to update slow-moving target vf
-    vf_target_moving_avg_ops = [
-        tf.assign(target, (1 - tau) * target + tau * source)
-        for target, source in zip(vf_TDtarget.vars, vf.vars)
-    ]
+    with tf.variable_scope("vf_target_assign"):
+        vf_target_moving_avg_ops = [
+            tf.assign(target, (1 - tau) * target + tau * source)
+            for target, source in zip(vf_TDtarget.vars, vf.vars)
+        ]
 
 
 
