@@ -234,7 +234,8 @@ class SquashedGaussianPolicy(object):
         self.mlp = MLP(name, input, hid_sizes, 2*output_size, activation, reg, reuse)
         self.mu, logstd = tf.split(self.mlp.out, 2, axis=1)
         self.logstd = tf.clip_by_value(logstd, -20.0, 2.0) # values taken from rllab
-        self.pdf = tf.distributions.Normal(loc=self.mu, scale=tf.exp(self.logstd))
+        self.std = tf.exp(self.logstd)
+        self.pdf = tf.distributions.Normal(loc=self.mu, scale=self.std)
         self.raw_ac = self.pdf.sample()
         self.ac = tf.tanh(self.raw_ac)
 
@@ -246,7 +247,7 @@ class SquashedGaussianPolicy(object):
     def logp(self, raw_actions):
         log_p = -(0.5 * tf.to_float(raw_actions.shape[-1]) * np.log(2 * np.pi)
             + tf.reduce_sum(self.logstd, axis=-1)
-            + 0.5 * tf.reduce_sum(((raw_actions - self.mu) / tf.exp(self.logstd)) ** 2, axis=-1)
+            + 0.5 * tf.reduce_sum(((raw_actions - self.mu) / self.std) ** 2, axis=-1)
         )
         EPS = 1e-6
         squash_correction = tf.reduce_sum(tf.log(1.0 - tf.tanh(raw_actions)**2 + EPS), axis=1)
@@ -254,3 +255,12 @@ class SquashedGaussianPolicy(object):
 
     def get_params_internal(self):
         return self.mlp.vars
+
+
+def minibatch_iter(size, *args):
+    N = args[0].shape[0]
+    for k in range(0, N - size + 1, size):
+        yield (a[k:(k+size)] for a in args)
+    if N % size != 0:
+        start = size * (N // size)
+        yield (a[start:] for a in args)
