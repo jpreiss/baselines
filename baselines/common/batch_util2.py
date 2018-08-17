@@ -12,7 +12,7 @@ def printstats(var, name):
 
 # for fixed length episodes
 # expects env to have ep_len member variable
-def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, callback=None):
+def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=None, callback=None):
 
     N = env.N
     dim = pi.dim
@@ -23,12 +23,7 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, c
     # Initialize history arrays
     obs = np.zeros((horizon, N, dim.ob_concat))
     acs = np.zeros((horizon, N, dim.ac))
-    if pi.flavor == "embed":
-        embeds = np.zeros((horizon, N, dim.embed))
-    elif pi.flavor == "extra":
-        embeds = np.zeros((horizon, N, dim.sysid))
-    else:
-        embeds = np.zeros((horizon, N, 1))
+    embeds = np.zeros((horizon, N, pi.est_target.shape[-1]))
     rews = np.zeros((horizon, N))
     vpreds = np.zeros((horizon, N))
     # rolling window, starting with zeros
@@ -58,11 +53,16 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, c
 
             obs[step,:,:] = ob
 
+            # TODO consider if stochastic or not?
+            target = pi.ac_stochastic if stochastic else pi.ac_mean
+            feed = { pi.ob : ob }
             if test:
-                ac, vpred, embed = pi.act_traj(
-                    stochastic, ob, ob_trajs[step], ac_trajs[step])
-            else:
-                ac, vpred, embed = pi.act(stochastic, ob)
+                feed = {**feed, **{
+                    pi.ob_traj : ob_trajs[step],
+                    pi.ac_traj : ac_trajs[step],
+                }}
+            ac, embed = sess.run([target, pi.est_target], feed)
+            vpred = float("nan") # TODO
 
             # epsilon-greedy exploration (TODO: pass in params)
             #rand_acts = np.random.uniform(-1.0, 1.0, size=ac.shape)
@@ -80,6 +80,7 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, c
                 ob_trajs[step+1,:,-1,:] = ob[:,:dim.ob]
                 ac_trajs[step+1,:,-1,:] = ac
 
+
             ob_next, rew, _, _ = env.step(ac)
             rews[step,:] = rew
 
@@ -94,11 +95,12 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, c
         ep_rews = np.sum(rews, axis=0)
 
         # evaluate SysID errors and add to the main rewards.
-        #sysids = obs[0,:,dim.ob:]
-        #assert np.all((sysids[None,:,:] == obs[:,:,dim.ob:]).flat)
-        #embed_trues = pi.sysid_to_embedded(sysids)
-        if False:
-            embed_estimates = pi.estimate_sysid(
+        sysids = obs[0,:,dim.ob:]
+        assert np.all((sysids[None,:,:] == obs[:,:,dim.ob:]).flat)
+        embed_trues = sess.run(pi.est_target, { pi.ob : obs[0,:,:] })
+
+        try:
+            embed_estimates = pi.estimate_sysid(sess,
                 ob_trajs.reshape((horizon * N, dim.window, dim.ob)),
                 ac_trajs.reshape((horizon * N, dim.window, dim.ac)))
             embed_estimates = embed_estimates.reshape((horizon, N, -1))
@@ -111,10 +113,13 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, c
                 begin = max(i - dim.window, 0)
                 sysid_loss[begin:i,:] += meanerr2s[i,:]
             sysid_loss *= (pi.alpha_sysid / dim.window)
-
             total_rews = rews - sysid_loss
             # TODO keep these separate and let the RL algorithm reason about it?
-        else:
+
+        except NotImplementedError:
+            # e.g. exploration policy - just make up garbage
+            embed_estimates = embed_trues + np.nan
+            sysid_loss = np.nan
             total_rews = rews
 
         # yield the batch to the RL algorithm
@@ -123,8 +128,8 @@ def sysid_simple_generator(pi, env, stochastic, test=False, force_render=None, c
             "rew" : total_rews, "task_rews" : rews,
             "ob_traj" : ob_trajs, "ac_traj" : ac_trajs,
             "ep_rews" : ep_rews, "ep_lens" : horizon + 0 * ep_rews,
-            # "embed_true" : embeds, "embed_estimate" : embed_estimates,
-            # "sysid_loss" : sysid_loss,
+            "embed_true" : embeds, "embed_estimate" : embed_estimates,
+            "sysid_loss" : sysid_loss,
         }
 
 
@@ -181,7 +186,7 @@ class ReplayBuffer(object):
             # normal case, batch fits in buffer
             for buf, batch in zip(self.bufs, args):
                 buf[self.cursor:new_end] = batch
-            self.cursor = new_end
+            self.cursor = new_end % self.N
             self.size = max(self.size, new_end)
         else:
             # special case, batch wraps around buffer.
