@@ -128,7 +128,7 @@ def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=N
             "rew" : total_rews, "task_rews" : rews,
             "ob_traj" : ob_trajs, "ac_traj" : ac_trajs,
             "ep_rews" : ep_rews, "ep_lens" : horizon + 0 * ep_rews,
-            "embed_true" : embeds, "embed_estimate" : embed_estimates,
+            "est_true" : embeds, "est_target" : embed_estimates,
             "sysid_loss" : sysid_loss,
         }
 
