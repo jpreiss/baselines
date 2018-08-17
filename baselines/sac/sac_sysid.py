@@ -1,9 +1,5 @@
-from baselines.common import Dataset, explained_variance, fmt_row, zipsame
 import baselines.common.batch_util2 as batch2
 from baselines import logger
-import baselines.common.tf_util as U
-from baselines.common.mpi_adam import MpiAdam
-from baselines.common.mpi_moments import mpi_moments
 
 import tensorflow as tf
 import numpy as np
@@ -71,69 +67,71 @@ def learn(np_random, env, policy_func, *,
         logdir
         ):
 
-    # this is just to grab Dim
-    with tf.variable_scope("ignore"):
-        ob_space = env.observation_space
-        ac_space = env.action_space
-        pi = policy_func("DO_NOT_USE", ob_space, ac_space)
-        dim = pi.dim
-
+    # get dims
+    ob_full_dim = env.observation_space.shape[0]
+    ac_dim = env.action_space.shape[0]
     N = env.N
 
+    # placeholders
+    ob_ph = tf.placeholder(tf.float32, (None, ob_full_dim), "ob")
+    ac_ph = tf.placeholder(tf.float32, (None, ac_dim), "ac")
+    rew_ph = tf.placeholder(tf.float32, (None, ), "rew")
+    nextob_ph = tf.placeholder(tf.float32, (None, ob_full_dim), "next_ob")
+
+    # construct policy, twice so we can reuse the embedder (if applicable)
+    with tf.variable_scope("pi"):
+        pi = policy_func(env.observation_space, env.action_space, ob_ph)
+    with tf.variable_scope("pi", reuse=True):
+        pi_nextob = policy_func(env.observation_space, env.action_space, nextob_ph)
 
     # TODO param
-    #lr = 1e-3
-    lr = 3e-4
+    lr = 1e-3
+    #lr = 3e-4
     scale_reward = 5.0
     tau = 0.005
     init_explore_steps = 1e4
     n_train_repeat = 2#int(np.log2(2*N)) # made-up heuristic
     buf_len = int(1e6)
-    mlp_size = (100, 100, 100)
+    vf_size = (256, 256, 256)
 
-
-    # placeholders
-    obs_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "ob")
-    ac_ph = tf.placeholder(tf.float32, (None, dim.ac), "ac")
-    rew_ph = tf.placeholder(tf.float32, (None, ), "rew")
-    nextob_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "next_ob")
+    # policy's probability of own stochastic action
+    with tf.variable_scope("log_prob"):
+        log_pi = pi.log_prob
 
     # value function
-    vf = batch2.MLP("myvf", obs_ph, mlp_size, 1, tf.nn.relu)
-
-    # policy
-    with tf.variable_scope("policy"):
-        reg = tf.contrib.layers.l2_regularizer(1e-3)
-        policy = batch2.SquashedGaussianPolicy("sgpolicy",
-            obs_ph, mlp_size, dim.ac, tf.nn.relu, reg=reg)
-        with tf.variable_scope("log_prob"):
-            log_pi = policy.logp(policy.raw_ac)
+    vf = batch2.MLP("myvf", pi.vf_input, vf_size, 1, tf.nn.relu)
 
     # double q functions - these ones are used "on-policy" in the vf loss
-    q_in = tf.concat([obs_ph, policy.ac], axis=1, name="q_in")
-    qf1 = batch2.MLP("qf1", q_in, mlp_size, 1, tf.nn.relu)
-    qf2 = batch2.MLP("qf2", q_in, mlp_size, 1, tf.nn.relu)
+    q_in = tf.concat([pi.vf_input, pi.ac_stochastic], axis=1, name="q_in")
+    qf1 = batch2.MLP("qf1", q_in, vf_size, 1, tf.nn.relu)
+    qf2 = batch2.MLP("qf2", q_in, vf_size, 1, tf.nn.relu)
     qf_min = tf.minimum(qf1.out, qf2.out, name="qf_min")
 
     # policy loss
+    # TODO impose L2 regularization externally?
     with tf.variable_scope("policy_loss"):
         policy_kl_loss = tf.reduce_mean(log_pi - qf_min)
-        pi_reg_losses = tf.get_collection(
-            tf.GraphKeys.REGULARIZATION_LOSSES, scope=policy.name)
-        pi_reg_losses += [policy.reg_loss]
+        pol_vars = set(pi.policy_vars)
+        pi_reg_losses = [v for v in
+            tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+            if v in pol_vars]
+        pi_reg_losses += [pi.reg_loss]
+        pi_reg_losses += [-var for var, name in pi.extra_rewards]
         policy_loss = policy_kl_loss + tf.reduce_sum(pi_reg_losses)
+        tf.summary.scalar("policy_kl_loss", policy_kl_loss)
 
     # value function loss
     with tf.variable_scope("vf_loss"):
         vf_loss = 0.5 * tf.reduce_mean((vf.out - tf.stop_gradient(qf_min - log_pi))**2)
+        tf.summary.scalar("vf_loss", vf_loss)
 
     # same q functions, but for the off-policy TD training
-    qtrain_in = tf.concat([obs_ph, ac_ph], axis=1)
-    qf1_t = batch2.MLP("qf1", qtrain_in, mlp_size, 1, tf.nn.relu, reuse=True)
-    qf2_t = batch2.MLP("qf2", qtrain_in, mlp_size, 1, tf.nn.relu, reuse=True)
+    qtrain_in = tf.concat([pi.vf_input, ac_ph], axis=1)
+    qf1_t = batch2.MLP("qf1", qtrain_in, vf_size, 1, tf.nn.relu, reuse=True)
+    qf2_t = batch2.MLP("qf2", qtrain_in, vf_size, 1, tf.nn.relu, reuse=True)
 
     # target (slow-moving) vf, used to update Q functions
-    vf_TDtarget = batch2.MLP("vf_target", nextob_ph, mlp_size, 1, tf.nn.relu)
+    vf_TDtarget = batch2.MLP("vf_target", pi_nextob.vf_input, vf_size, 1, tf.nn.relu)
 
     # q fn TD-target & losses
     with tf.variable_scope("TD_target"):
@@ -142,14 +140,16 @@ def learn(np_random, env, policy_func, *,
 
     with tf.variable_scope("TD_loss1"):
         TD_loss1 = 0.5 * tf.reduce_mean((TD_target - qf1_t.out)**2)
+        tf.summary.scalar("TD_loss1", TD_loss1)
 
     with tf.variable_scope("TD_loss2"):
         TD_loss2 = 0.5 * tf.reduce_mean((TD_target - qf2_t.out)**2)
+        tf.summary.scalar("TD_loss2", TD_loss2)
 
 
     # training ops
     policy_opt_op = tf.train.AdamOptimizer(lr, name="policy_adam").minimize(
-        policy_loss, var_list=policy.get_params_internal())
+        policy_loss, var_list=pi.policy_vars)
 
     vf_opt_op = tf.train.AdamOptimizer(lr, name="vf_adam").minimize(
         vf_loss, var_list=vf.vars)
@@ -170,14 +170,14 @@ def learn(np_random, env, policy_func, *,
         ]
 
 
-
-    buf_dims = (dim.ob_concat, dim.ac, 1, dim.ob_concat)
+    buf_dims = (ob_full_dim, ac_dim, 1, ob_full_dim)
     replay_buf = batch2.ReplayBuffer(buf_len, buf_dims)
 
 
     with tf.Session() as sess:
 
         writer = tf.summary.FileWriter('./board', sess.graph)
+        summaries = tf.summary.merge_all()
 
         # init tf
         sess.run(tf.global_variables_initializer())
@@ -185,6 +185,7 @@ def learn(np_random, env, policy_func, *,
         #sess.run([tf.assign(vtarg, v) for vtarg, v in zip(V_target.vars, V.vars)])
 
         do_train = False
+        n_trains = [0] # get ref semantics in callback closure. lol @python
 
         # update the policy every time step for high sample efficiency
         # note: closure around do_train
@@ -204,7 +205,7 @@ def learn(np_random, env, policy_func, *,
             for i in range(n_train_repeat):
                 ot, at, rt, ot1 = replay_buf.sample(np_random, optim_batchsize)
                 feed_dict = {
-                    obs_ph: ot,
+                    ob_ph: ot,
                     ac_ph: at,
                     rew_ph: rt[:,0],
                     nextob_ph: ot1,
@@ -213,12 +214,18 @@ def learn(np_random, env, policy_func, *,
                 sess.run(train_ops, feed_dict)
                 sess.run(vf_target_moving_avg_ops)
 
+                if i == 0 and n_trains[0] % 1e3 == 0:
+                    summary = sess.run(summaries, feed_dict)
+                    writer.add_summary(summary, i)
+
+            n_trains[0] += 1
+
 
         explore_epochs = int(np.ceil(float(init_explore_steps) / (N * env.ep_len)))
         print(f"random exploration stage: {explore_epochs} epochs...")
 
-        policy_uniform = UniformPolicy(-np.ones(dim.ac), np.ones(dim.ac))
-        policy_uniform.dim = dim
+        policy_uniform = UniformPolicy(-np.ones(ac_dim), np.ones(ac_dim))
+        policy_uniform.dim = pi.dim
 
         exploration_gen = batch2.sysid_simple_generator(
             policy_uniform, env, stochastic=True, test=False,
@@ -232,8 +239,8 @@ def learn(np_random, env, policy_func, *,
         do_train = True
 
         print("begin policy rollouts")
-        policy_wrapper = TempPolicy(sess, obs_ph, policy.ac)
-        policy_wrapper.dim = dim
+        policy_wrapper = TempPolicy(sess, ob_ph, pi.ac_stochastic)
+        policy_wrapper.dim = pi.dim
 
         iters_so_far = 0
         tstart = time.time()
@@ -279,7 +286,8 @@ def learn(np_random, env, policy_func, *,
             iters_so_far += 1
             ep_rew = np.sum(rew, axis=0)
             logger.record_tabular("EpRewMean", np.mean(ep_rew.flat))
-            logger.record_tabular("EpRewWorst", np.amin(ep_rew))
+            logger.record_tabular("EpRewBest", np.amax(ep_rew.flat))
+            logger.record_tabular("EpRewWorst", np.amin(ep_rew.flat))
             logger.record_tabular("TimeElapsed", time.time() - tstart)
             for i in range(N):
                 logger.record_tabular("Env{}Rew".format(i), ep_rew[i])
