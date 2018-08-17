@@ -141,6 +141,13 @@ def learn(
 
     train_ops = [policy_opt_op, vf_opt_op, qf1_opt_op, qf2_opt_op]
 
+    # SysID estimator - does not use replay buffer
+    if len(pi.estimator_vars) > 0:
+        estimator_opt_op = tf.train.AdamOptimizer(learning_rate, name="estimator_adam").minimize(
+            pi.estimator_loss, var_list=pi.estimator_vars)
+    else:
+        estimator_opt_op = None
+
     # ops to update slow-moving target vf
     with tf.variable_scope("vf_target_assign"):
         vf_target_moving_avg_ops = [
@@ -236,11 +243,31 @@ def learn(
 
         logger.log("********** Iteration %i ************"%iters_so_far)
 
+        def seg_flatten(seg):
+            shape = [seg.shape[0] * seg.shape[1]] + list(seg.shape[2:])
+            return seg.reshape(shape)
+
         ob, ac, rew = seg["ob"], seg["ac"], seg["task_rews"]
+        ob_flat = seg_flatten(ob)
 
         # TODO: uniform exploration policy
         if replay_buf.size < init_explore_steps:
             continue
+
+        # the estimator must be trained "on-policy" because we reward the policy 
+        # for behaving in a way that makes estimation easier.
+        # therefore, we don't use the replay buffer to train the estimator.
+        if estimator_opt_op is not None:
+            ob_traj = seg_flatten(seg["ob_traj"])
+            ac_traj = seg_flatten(seg["ac_traj"])
+            assert ob_traj.shape[0] == ob_flat.shape[0]
+            est_target = seg["est_true"]
+            estimator_loss, _ = sess.run([pi.estimator_loss, estimator_opt_op], {
+                pi.ob : ob_flat,
+                pi.ob_traj : ob_traj,
+                pi.ac_traj : ac_traj,
+            })
+            logger.record_tabular("estimator_rmse", np.sqrt(estimator_loss))
 
         #logger.record_tabular("V_loss", V_loss_b)
         #logger.record_tabular("V_mean", np.mean(V_b.flat))
