@@ -42,6 +42,7 @@ def learn(
     policy_func,       # func takes (ob space, ac space, ob input placeholder)
     max_iters,         # stop after this many iters (defined by env.ep_len)
     logdir,            # directory to write csv logs
+    tboard_dir,        # directory to write tensorboard summaries & graph
 
     learning_rate,     # ...
     init_explore_steps,# explore this many steps with random policy at start
@@ -98,6 +99,8 @@ def learn(
         pi_reg_losses += [-var for var, name in pi.extra_rewards]
         policy_loss = policy_kl_loss + tf.reduce_sum(pi_reg_losses)
         tf.summary.scalar("policy_kl_loss", policy_kl_loss)
+        for t, name in pi.extra_rewards:
+            tf.summary.scalar(name, t)
 
     # value function loss
     with tf.variable_scope("vf_loss"):
@@ -160,10 +163,12 @@ def learn(
     replay_buf = batch2.ReplayBuffer(buf_len, buf_dims)
 
 
-    writer = tf.summary.FileWriter('./board', sess.graph)
-    summaries = tf.summary.merge_all()
-
     # init tf
+    writer = None
+    if tboard_dir is not None:
+        writer = tf.summary.FileWriter(tboard_dir, sess.graph)
+        summaries = tf.summary.merge_all()
+
     sess.run(tf.global_variables_initializer())
     sess.run(vf_target_moving_avg_ops)
     #sess.run([tf.assign(vtarg, v) for vtarg, v in zip(V_target.vars, V.vars)])
@@ -198,7 +203,7 @@ def learn(
             sess.run(train_ops, feed_dict)
             sess.run(vf_target_moving_avg_ops)
 
-            if i == 0 and n_trains[0] % 1e3 == 0:
+            if (writer is not None) and (i == 0) and (n_trains[0] % 1e3 == 0):
                 summary = sess.run(summaries, feed_dict)
                 writer.add_summary(summary, i)
 
@@ -242,6 +247,7 @@ def learn(
             break
 
         logger.log("********** Iteration %i ************"%iters_so_far)
+        logger.record_tabular("__flavor__", pi.flavor) # underscore for sorting first
 
         def seg_flatten(seg):
             shape = [seg.shape[0] * seg.shape[1]] + list(seg.shape[2:])
@@ -261,13 +267,19 @@ def learn(
             ob_traj = seg_flatten(seg["ob_traj"])
             ac_traj = seg_flatten(seg["ac_traj"])
             assert ob_traj.shape[0] == ob_flat.shape[0]
-            est_target = seg["est_true"]
-            estimator_loss, _ = sess.run([pi.estimator_loss, estimator_opt_op], {
-                pi.ob : ob_flat,
-                pi.ob_traj : ob_traj,
-                pi.ac_traj : ac_traj,
-            })
-            logger.record_tabular("estimator_rmse", np.sqrt(estimator_loss))
+            #est_target = seg["est_true"]
+            sum_mserr = 0.0
+            count = 0
+            for ob, obt, act in batch2.minibatch_iter(minibatch,
+                ob_flat, ob_traj, ac_traj):
+                estimator_loss, _ = sess.run([pi.estimator_loss, estimator_opt_op], {
+                    pi.ob : ob,
+                    pi.ob_traj : obt,
+                    pi.ac_traj : act,
+                })
+                sum_mserr += estimator_loss
+                count += 1
+            logger.record_tabular("estimator_rmse", np.sqrt(sum_mserr / count))
 
         #logger.record_tabular("V_loss", V_loss_b)
         #logger.record_tabular("V_mean", np.mean(V_b.flat))
