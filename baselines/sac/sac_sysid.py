@@ -52,6 +52,7 @@ def learn(
     TD_discount,       # ...
     reward_scale,      # SAC uses reward scaling instead of entropy weighting
     tau,               # exp. moving avg. speed for value fn estimator
+    vf_grad_thru_embed,# whether to allow the value function's gradient to pass through the embedder or not
     ):
 
     # get dims
@@ -71,6 +72,10 @@ def learn(
     with tf.variable_scope("pi", reuse=True):
         pi_nextob = policy_func(env.observation_space, env.action_space, nextob_ph)
 
+    vf_in = pi.vf_input
+    if not vf_grad_thru_embed:
+        vf_in = tf.stop_gradient(vf_in)
+
     # TODO param
     vf_size = (256, 256, 256)
 
@@ -79,25 +84,28 @@ def learn(
         log_pi = pi.log_prob
 
     # value function
-    vf = batch2.MLP("myvf", pi.vf_input, vf_size, 1, tf.nn.relu)
+    vf = batch2.MLP("myvf", vf_in, vf_size, 1, tf.nn.relu)
 
     # double q functions - these ones are used "on-policy" in the vf loss
-    q_in = tf.concat([pi.vf_input, pi.ac_stochastic], axis=1, name="q_in")
+    q_in = tf.concat([vf_in, pi.ac_stochastic], axis=1, name="q_in")
     qf1 = batch2.MLP("qf1", q_in, vf_size, 1, tf.nn.relu)
     qf2 = batch2.MLP("qf2", q_in, vf_size, 1, tf.nn.relu)
     qf_min = tf.minimum(qf1.out, qf2.out, name="qf_min")
+
+    if len(pi.extra_rewards) > 0:
+        extra_losses = -tf.add_n([v for v, name in pi.extra_rewards])
+    else:
+        extra_losses = 0.0
 
     # policy loss
     # TODO impose L2 regularization externally?
     with tf.variable_scope("policy_loss"):
         policy_kl_loss = tf.reduce_mean(log_pi - qf_min)
         pol_vars = set(pi.policy_vars)
-        pi_reg_losses = [v for v in
+        pi_reg_losses = tf.reduce_sum([v for v in
             tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-            if v in pol_vars]
-        pi_reg_losses += [pi.reg_loss]
-        pi_reg_losses += [-var for var, name in pi.extra_rewards]
-        policy_loss = policy_kl_loss + tf.reduce_sum(pi_reg_losses)
+            if v in pol_vars])
+        policy_loss = policy_kl_loss + pi_reg_losses + extra_losses
         tf.summary.scalar("policy_kl_loss", policy_kl_loss)
         for t, name in pi.extra_rewards:
             tf.summary.scalar(name, t)
@@ -105,10 +113,11 @@ def learn(
     # value function loss
     with tf.variable_scope("vf_loss"):
         vf_loss = 0.5 * tf.reduce_mean((vf.out - tf.stop_gradient(qf_min - log_pi))**2)
+        vf_loss += extra_losses
         tf.summary.scalar("vf_loss", vf_loss)
 
     # same q functions, but for the off-policy TD training
-    qtrain_in = tf.concat([pi.vf_input, ac_ph], axis=1)
+    qtrain_in = tf.concat([vf_in, ac_ph], axis=1)
     qf1_t = batch2.MLP("qf1", qtrain_in, vf_size, 1, tf.nn.relu, reuse=True)
     qf2_t = batch2.MLP("qf2", qtrain_in, vf_size, 1, tf.nn.relu, reuse=True)
 
@@ -122,10 +131,12 @@ def learn(
 
     with tf.variable_scope("TD_loss1"):
         TD_loss1 = 0.5 * tf.reduce_mean((TD_target - qf1_t.out)**2)
+        TD_loss1 += extra_losses
         tf.summary.scalar("TD_loss1", TD_loss1)
 
     with tf.variable_scope("TD_loss2"):
         TD_loss2 = 0.5 * tf.reduce_mean((TD_target - qf2_t.out)**2)
+        TD_loss2 += extra_losses
         tf.summary.scalar("TD_loss2", TD_loss2)
 
 
