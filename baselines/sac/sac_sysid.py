@@ -39,6 +39,7 @@ def learn(
     sess,              # TF Session
     np_random,         # numpy.random.RandomState for determinism
     env,               # environment w/ OpenAI Gym API
+    dim,               # Dimension namedtuple
     policy_func,       # func takes (ob space, ac space, ob input placeholder)
     max_iters,         # stop after this many iters (defined by env.ep_len)
     logdir,            # directory to write csv logs
@@ -56,21 +57,21 @@ def learn(
     ):
 
     # get dims
-    ob_full_dim = env.observation_space.shape[0]
-    ac_dim = env.action_space.shape[0]
     N = env.N
 
     # placeholders
-    ob_ph = tf.placeholder(tf.float32, (None, ob_full_dim), "ob")
-    ac_ph = tf.placeholder(tf.float32, (None, ac_dim), "ac")
+    ob_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "ob")
+    ac_ph = tf.placeholder(tf.float32, (None, dim.ac), "ac")
+    ob_traj_ph = tf.placeholder(tf.float32, (None, dim.window, dim.ob), "ob_traj")
+    ac_traj_ph = tf.placeholder(tf.float32, (None, dim.window, dim.ac), "ac_traj")
     rew_ph = tf.placeholder(tf.float32, (None, ), "rew")
-    nextob_ph = tf.placeholder(tf.float32, (None, ob_full_dim), "next_ob")
+    nextob_ph = tf.placeholder(tf.float32, (None, dim.ob_concat), "next_ob")
 
     # construct policy, twice so we can reuse the embedder (if applicable)
     with tf.variable_scope("pi"):
-        pi = policy_func(env.observation_space, env.action_space, ob_ph)
+        pi = policy_func(env.observation_space, env.action_space, ob_ph, ob_traj_ph, ac_traj_ph)
     with tf.variable_scope("pi", reuse=True):
-        pi_nextob = policy_func(env.observation_space, env.action_space, nextob_ph)
+        pi_nextob = policy_func(env.observation_space, env.action_space, nextob_ph, ob_traj_ph, ac_traj_ph)
 
     vf_in = pi.vf_input
     if not vf_grad_thru_embed:
@@ -93,7 +94,7 @@ def learn(
     qf_min = tf.minimum(qf1.out, qf2.out, name="qf_min")
 
     if len(pi.extra_rewards) > 0:
-        extra_losses = -tf.add_n([v for v, name in pi.extra_rewards])
+        extra_losses = -tf.add_n(pi.extra_rewards)
     else:
         extra_losses = 0.0
 
@@ -107,7 +108,7 @@ def learn(
             if v in pol_vars])
         policy_loss = policy_kl_loss + pi_reg_losses + extra_losses
         tf.summary.scalar("policy_kl_loss", policy_kl_loss)
-        for t, name in pi.extra_rewards:
+        for t, name in zip(pi.extra_rewards, pi.extra_reward_names):
             tf.summary.scalar(name, t)
 
     # value function loss
@@ -159,6 +160,7 @@ def learn(
     if len(pi.estimator_vars) > 0:
         estimator_opt_op = tf.train.AdamOptimizer(learning_rate, name="estimator_adam").minimize(
             pi.estimator_loss, var_list=pi.estimator_vars)
+        tf.summary.scalar("estimator_loss", pi.estimator_loss)
     else:
         estimator_opt_op = None
 
@@ -170,7 +172,7 @@ def learn(
         ]
 
 
-    buf_dims = (ob_full_dim, ac_dim, 1, ob_full_dim)
+    buf_dims = (dim.ob_concat, dim.ac, 1, dim.ob_concat)
     replay_buf = batch2.ReplayBuffer(buf_len, buf_dims)
 
 
@@ -224,7 +226,7 @@ def learn(
     explore_epochs = int(np.ceil(float(init_explore_steps) / (N * env.ep_len)))
     print(f"random exploration stage: {explore_epochs} epochs...")
 
-    policy_uniform = UniformPolicy(-np.ones(ac_dim), np.ones(ac_dim))
+    policy_uniform = UniformPolicy(-np.ones(dim.ac), np.ones(dim.ac))
     policy_uniform.dim = pi.dim
 
     exploration_gen = batch2.sysid_simple_generator(sess,
