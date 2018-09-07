@@ -25,12 +25,15 @@ def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=N
     acs = np.zeros((horizon, N, dim.ac))
     embeds = np.zeros((horizon, N, pi.est_target.shape[-1]))
     rews = np.zeros((horizon, N))
-    vpreds = np.zeros((horizon, N))
     # rolling window, starting with zeros
     ob_trajs = np.zeros((horizon, N, dim.window, dim.ob))
     ac_trajs = np.zeros((horizon, N, dim.window, dim.ac))
 
     npr = env.np_random
+
+    uninit = tf.report_uninitialized_variables().shape.num_elements()
+    if uninit and uninit > 0:
+        sess.run(tf.global_variables_initializer())
 
     for episode in itertools.count():
 
@@ -62,7 +65,6 @@ def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=N
                     pi.ac_traj : ac_trajs[step],
                 }}
             ac, embed = sess.run([target, pi.est_target], feed)
-            vpred = float("nan") # TODO
 
             # epsilon-greedy exploration (TODO: pass in params)
             #rand_acts = np.random.uniform(-1.0, 1.0, size=ac.shape)
@@ -71,7 +73,6 @@ def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=N
             #ac[greedy] = rand_acts[greedy]
 
             acs[step,:,:] = ac
-            vpreds[step,:] = vpred
             embeds[step,:,:] = embed
 
             if step < horizon - 1:
@@ -106,7 +107,10 @@ def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=N
             embed_estimates = embed_estimates.reshape((horizon, N, -1))
             err2s = (embeds - embed_estimates) ** 2
             assert len(err2s.shape) == 3
-            meanerr2s = np.mean(err2s, axis=-1)
+            if err2s.shape[-1] == 0:
+                meanerr2s = np.zeros(err2s.shape[:-1])
+            else:
+                meanerr2s = np.mean(err2s, axis=-1)
             # apply the err2 for each window to *all* actions in that window
             sysid_loss = 0 * rews
             for i in range(horizon):
@@ -124,11 +128,11 @@ def sysid_simple_generator(sess, pi, env, stochastic, test=False, force_render=N
 
         # yield the batch to the RL algorithm
         yield {
-            "ob" : obs, "vpred" : vpreds, "ac" : acs,
+            "ob" : obs, "ac" : acs,
             "rew" : total_rews, "task_rews" : rews,
             "ob_traj" : ob_trajs, "ac_traj" : ac_trajs,
             "ep_rews" : ep_rews, "ep_lens" : horizon + 0 * ep_rews,
-            "est_true" : embeds, "est_target" : embed_estimates,
+            "est_true" : embeds, "est" : embed_estimates,
             "sysid_loss" : sysid_loss,
         }
 
@@ -153,7 +157,7 @@ def add_vtarg_and_adv(seg, gamma, lam):
 
 # flattens arrays that are (horizon, N, ...) shape into (horizon * N, ...)
 def seg_flatten_batches(seg):
-    for s in ("ob", "ac", "task_rews", "ob_traj", "ac_traj", "embed_true", "adv", "tdlamret", "vpred"):
+    for s in ("ob", "ac", "task_rews", "ob_traj", "ac_traj", "est_true", "adv", "tdlamret", "vpred"):
         sh = seg[s].shape
         newshape = [sh[0] * sh[1]] + list(sh[2:])
         seg[s] = np.reshape(seg[s], newshape)
@@ -237,19 +241,29 @@ class SquashedGaussianPolicy(object):
 
         self.name = name
         self.mlp = MLP(name, input, hid_sizes, 2*output_size, activation, reg, reuse)
+        self.mlp.out *= 0.1
         self.mu, logstd = tf.split(self.mlp.out, 2, axis=1)
-        self.logstd = tf.clip_by_value(logstd, -20.0, 2.0) # values taken from rllab
+        #self.logstd = tf.clip_by_value(logstd, -20.0, 2.0) # values taken from rllab
+        self.logstd = -0.3 + 0.0 * self.mu
         self.std = tf.exp(self.logstd)
         self.pdf = tf.distributions.Normal(loc=self.mu, scale=self.std)
         self.raw_ac = self.pdf.sample()
         self.ac = tf.tanh(self.raw_ac)
 
+        with tf.variable_scope("squashed_entropy_bound"):
+            squash_correction = tf.log(1.0 - tf.tanh(self.mu) ** 2)
+        self.entropy = self.pdf.entropy()
+        self.entropy = tf.reduce_sum(self.entropy + squash_correction, axis=-1)
+
         self.reg_loss = 5e-4 * (
             tf.reduce_mean(self.logstd ** 2) + tf.reduce_mean(self.mu ** 2))
 
 
+    def logp(self, actions):
+        return self.logp_raw(tf.atanh(actions))
+
     # actions should be raw_ac, with tanh not applied
-    def logp(self, raw_actions):
+    def logp_raw(self, raw_actions):
         log_p = -(0.5 * tf.to_float(raw_actions.shape[-1]) * np.log(2 * np.pi)
             + tf.reduce_sum(self.logstd, axis=-1)
             + 0.5 * tf.reduce_sum(((raw_actions - self.mu) / self.std) ** 2, axis=-1)
@@ -264,8 +278,9 @@ class SquashedGaussianPolicy(object):
 
 def minibatch_iter(size, *args):
     N = args[0].shape[0]
+    order = np.random.permutation(N)
     for k in range(0, N - size + 1, size):
-        yield (a[k:(k+size)] for a in args)
+        yield (a[order[k:(k+size)]] for a in args)
     if N % size != 0:
         start = size * (N // size)
-        yield (a[start:] for a in args)
+        yield (a[order[start:]] for a in args)
